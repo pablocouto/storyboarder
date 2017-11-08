@@ -68,6 +68,12 @@
         "icon": "build/fileassociation/file"
       },
       {
+        "ext": "storyboarderscene",
+        "name": "Storyboarder Scene",
+        "icon": "build/fileassociation/file",
+        "isPackage": true
+      },
+      {
         "ext": "storyboarderproject",
         "name": "Storyboarder Project",
         "icon": "build/fileassociation/file",
