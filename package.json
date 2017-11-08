@@ -61,11 +61,19 @@
       "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
       "category": "Graphics"
     },
-    "fileAssociations": {
-      "ext": "storyboarder",
-      "name": "Storyboarder file",
-      "icon": "build/fileassociation/file"
-    },
+    "fileAssociations": [
+      {
+        "ext": "storyboarder",
+        "name": "Storyboarder Scene",
+        "icon": "build/fileassociation/file"
+      },
+      {
+        "ext": "storyboarderproject",
+        "name": "Storyboarder Project",
+        "icon": "build/fileassociation/file",
+        "isPackage": true
+      }
+    ],
     "protocols": [
       {
         "name": "Storyboarder",
