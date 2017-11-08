@@ -265,6 +265,37 @@ let openFile = filepath => {
   let filename = path.basename(filepath)
   let extname = path.extname(filepath)
 
+  // is it a folder?
+  try {
+    if (fs.statSync(filepath).isDirectory()) {
+      if (extname === '.storyboarderproject') {
+        //
+        //
+        //
+        // TODO
+        //
+        //
+        //
+        dialog.showMessageBox({
+          type: 'error',
+          message: `Package type not yet supported (${extname}).\n` + error.message,
+        })
+        return
+      } else if (extname === '.storyboarderscene') {
+        // look inside for the named .storyboarder
+        extname = '.storyboarder'
+        filename = path.basename(filepath, path.extname(filepath)) + extname
+        filepath = path.join(filepath, filename)
+      }
+    } 
+  } catch (error) {
+    dialog.showMessageBox({
+      type: 'error',
+      message: 'Could not open file.\n' + error.message,
+    })
+    return
+  }
+
   if (extname === '.storyboarder') {
     /// LOAD STORYBOARDER FILE
     addToRecentDocs(filepath, {
