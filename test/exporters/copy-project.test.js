@@ -23,28 +23,28 @@ describe('exporters/copyProject', () => {
     mockFs({
       [fixturesPath]: {
         'projects': {
-          'multi-scene': {
-            'multi-scene.fdx': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene', 'multi-scene.fdx'))),
+          'multi-scene.storyboarderproject': {
+            'multi-scene.fdx': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene.storyboarderproject', 'multi-scene.fdx'))),
             'storyboards': {
-              'storyboard.settings': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene', 'storyboards', 'storyboard.settings'))),
-              'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM': {
-                'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene', 'storyboards', 'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM', 'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarder'))),
+              'storyboard.settings': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene.storyboarderproject', 'storyboards', 'storyboard.settings'))),
+              'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarderscene': {
+                'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene.storyboarderproject', 'storyboards', 'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarderscene', 'Scene-1-EXT-A-PLACE-DAY-1-ZX3ZM.storyboarder'))),
                 'images': {
                   'board-1-E3XMX-reference.png':  new Buffer([8, 6, 7, 5, 3, 0, 9]),
                   'board-1-E3XMX.png':            new Buffer([8, 6, 7, 5, 3, 0, 9]),
                   'board-1-E3XMX-thumbnail.png':  new Buffer([8, 6, 7, 5, 3, 0, 9])
                 }
               },
-              'Scene-2-INT-A-PLACE-DAY-2-FA5K7': {
-                'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene', 'storyboards', 'Scene-2-INT-A-PLACE-DAY-2-FA5K7', 'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarder'))),
+              'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarderscene': {
+                'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene.storyboarderproject', 'storyboards', 'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarderscene', 'Scene-2-INT-A-PLACE-DAY-2-FA5K7.storyboarder'))),
                 'images': {
                   'board-1-35FBF-reference.png':  new Buffer([8, 6, 7, 5, 3, 0, 9]),
                   'board-1-35FBF.png':            new Buffer([8, 6, 7, 5, 3, 0, 9]),
                   'board-1-35FBF-thumbnail.png':  new Buffer([8, 6, 7, 5, 3, 0, 9])
                 }
               },
-              'Scene-3-EXT-HOUSE-DAY-3-T5KRK': {
-                'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene', 'storyboards', 'Scene-3-EXT-HOUSE-DAY-3-T5KRK', 'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarder'))),
+              'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarderscene': {
+                'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'projects', 'multi-scene.storyboarderproject', 'storyboards', 'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarderscene', 'Scene-3-EXT-HOUSE-DAY-3-T5KRK.storyboarder'))),
                 'images': {
                   'board-1-MMN03-reference.png':  new Buffer([8, 6, 7, 5, 3, 0, 9]),
                   'board-1-MMN03.png':            new Buffer([8, 6, 7, 5, 3, 0, 9]),
@@ -55,8 +55,8 @@ describe('exporters/copyProject', () => {
           }
         },
 
-        'ducks': {
-          'ducks.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'ducks', 'ducks.storyboarder'))),
+        'ducks.storyboarderscene': {
+          'ducks.storyboarder': fs.readFileSync(path.resolve(path.join(fixturesPath, 'ducks.storyboarderscene', 'ducks.storyboarder'))),
           'images': {
             'board-2-42VR9.png':                  new Buffer([8, 6, 7, 5, 3, 0, 9]),
             'board-2-42VR9-reference.png':        new Buffer([8, 6, 7, 5, 3, 0, 9]),
@@ -113,7 +113,7 @@ describe('exporters/copyProject', () => {
   // })
 
   it('can copy a single-scene project', () => {
-    let srcFilePath = path.resolve(path.join(fixturesPath, 'ducks', 'ducks.storyboarder'))
+    let srcFilePath = path.resolve(path.join(fixturesPath, 'ducks.storyboarderscene', 'ducks.storyboarder'))
     let dstFolderPath = path.resolve(path.join(fixturesPath, 'new-single-scene'))
     assert.equal(exporterCopyProject.getFilesUsedByProject(srcFilePath).length, 21) // files, excluding .storyboarder
 

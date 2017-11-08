@@ -22,14 +22,14 @@ describe('exporters/cleanup', function () {
 
   before(function () {
     // use real filesystem
-    absolutePathToStoryboarderFile = path.resolve(path.join(fixturesPath, 'ducks', 'ducks.storyboarder'))
+    absolutePathToStoryboarderFile = path.resolve(path.join(fixturesPath, 'ducks.storyboarderscene', 'ducks.storyboarder'))
 
     const actualJsonAsString = fs.readFileSync(absolutePathToStoryboarderFile)
 
     // fake filesystem
     mockFs({
       [fixturesPath]: {
-        'ducks': {
+        'ducks.storyboarderscene': {
           'ducks.storyboarder': actualJsonAsString,
           'images': {
             'board-2-42VR9.png':                  new Buffer([8, 6, 7, 5, 3, 0, 9]),
@@ -112,13 +112,13 @@ describe('exporters/cleanup', function () {
         assert.equal(newBoardData.boards[0].url, project.boards[0].url)
 
         assert(
-          fs.readdirSync(path.resolve(path.join(fixturesPath, 'ducks', 'images')))
+          fs.readdirSync(path.resolve(path.join(fixturesPath, 'ducks.storyboarderscene', 'images')))
             .includes('board-1-42VR9-thumbnail.png')
         )
 
         // it renames PSDs that are linked (board-2-42VR9.psd)
-        assert.equal(fs.existsSync(path.join(fixturesPath, 'ducks', 'images', 'board-2-42VR9.psd')), false)
-        assert.equal(fs.existsSync(path.join(fixturesPath, 'ducks', 'images', 'board-1-42VR9.psd')), true)
+        assert.equal(fs.existsSync(path.join(fixturesPath, 'ducks.storyboarderscene', 'images', 'board-2-42VR9.psd')), false)
+        assert.equal(fs.existsSync(path.join(fixturesPath, 'ducks.storyboarderscene', 'images', 'board-1-42VR9.psd')), true)
 
         // it removes links for PSD files that don't exist (board-0-P2FLS.png)
         assert.equal(newBoardData.boards[2].url, 'board-3-P2FLS.png') // confirm it was renamed
