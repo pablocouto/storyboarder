@@ -445,7 +445,8 @@ const findOrCreateProjectFolder = (scriptDataObject) => {
 let openDialogue = () => {
   dialog.showOpenDialog({
     properties: [
-      'openDirectory'
+      'openDirectory',
+      'openFile'
     ],
     filters: [
       {
