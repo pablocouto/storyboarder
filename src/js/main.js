@@ -273,18 +273,27 @@ let openFile = filepath => {
   try {
     if (fs.statSync(filepath).isDirectory()) {
       if (extname === '.storyboarderproject') {
-        //
-        //
-        //
-        // TODO
-        //
-        //
-        //
-        dialog.showMessageBox({
-          type: 'error',
-          message: `Package type not yet supported (${extname}).\n` + error.message,
-        })
-        return
+        // search for the named .fdx or .fountain in parent folder
+        let parentFolder = path.dirname(filepath)
+
+        let found = false
+        for (ext of ['.fountain', '.fdx']) {
+          let withExt = path.basename(filepath, path.extname(filepath)) + ext
+          if (fs.existsSync(path.join(parentFolder, withExt))) {
+            extname = ext
+            filename = withExt
+            filepath = path.join(parentFolder, withExt)
+            found = true
+            break
+          }
+        }
+
+        if (!found) {
+          dialog.showMessageBox({
+            message: `Could not find related script in parent ${parentFolder}.`
+          })
+          return
+        }
       } else if (extname === '.storyboarderscene') {
         // look inside for the named .storyboarder
         extname = '.storyboarder'
