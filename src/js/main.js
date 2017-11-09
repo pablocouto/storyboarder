@@ -387,11 +387,32 @@ let openFile = filepath => {
 }
 
 const findOrCreateProjectFolder = (scriptDataObject) => {
+  let projectPath = path.join(
+    path.dirname(currentFile),
+    path.basename(currentFile, path.extname(currentFile)) + '.storyboarderproject'
+  )
+
+  if (!fs.existsSync(path.join(projectPath))) {
+    dialog.showMessageBox({
+      message: 'Could not find associated project for this script.'
+    })
+    //
+    //
+    //
+    // TODO migrate to new format
+    //
+    //
+    return
+  }
+
   // check for storyboard.settings file
-  if (fs.existsSync(path.join(currentPath)) && 
-      fs.existsSync(path.join(currentPath, 'storyboard.settings'))) 
+  if (
+    fs.existsSync(path.join(projectPath, 'storyboards')) && 
+    fs.existsSync(path.join(projectPath, 'storyboards', 'storyboard.settings'))
+  )
   {
     // project already exists
+    currentPath = path.join(projectPath, 'storyboards')
     let boardSettings = JSON.parse(fs.readFileSync(path.join(currentPath, 'storyboard.settings')))
     if (!boardSettings.lastScene) {
       boardSettings.lastScene = 0
