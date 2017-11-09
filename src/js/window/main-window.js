@@ -3109,9 +3109,10 @@ let loadScene = async (sceneNumber) => {
   currentBoard = 0
 
   // does the boardfile/directory exist?
-  let boardsDirectoryFolders = fs.readdirSync(currentPath).filter(function(file) {
-    return fs.statSync(path.join(currentPath, file)).isDirectory()
-  })
+  let boardsDirectoryFolders = fs.readdirSync(currentPath)
+    .filter(
+      file => fs.statSync(path.join(currentPath, file)).isDirectory()
+    )
 
   let sceneCount = 0
 
