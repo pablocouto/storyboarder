@@ -3141,7 +3141,7 @@ let loadScene = async (sceneNumber) => {
         }
 
         for (var directory of boardsDirectoryFolders) {
-          let directoryId = directory.split('-')
+          let directoryId = path.basename(directory, path.extname(directory)).split('-')
           directoryId = directoryId[directoryId.length - 1]
           if (directoryId == id) {
             directoryFound = true
@@ -3191,7 +3191,7 @@ let loadScene = async (sceneNumber) => {
           }
 
 
-          boardFilename = path.join(currentPath, foundDirectoryName, foundDirectoryName + '.storyboarder')
+          boardFilename = path.join(currentPath, foundDirectoryName, path.basename(foundDirectoryName, path.extname(foundDirectoryName)) + '.storyboarder')
           boardData = JSON.parse(fs.readFileSync(boardFilename))
         }
 
