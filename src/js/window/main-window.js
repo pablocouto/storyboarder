@@ -3162,6 +3162,7 @@ let loadScene = async (sceneNumber) => {
             directoryName += node.slugline.substring(0, 50).replace(/\|&;\$%@"<>\(\)\+,/g, '').replace(/\./g, '').replace(/ - /g, ' ').replace(/ /g, '-').replace(/[|&;/:$%@"{}?|<>()+,]/g, '-')
           }
           directoryName += '-' + node.scene_id
+          directoryName += '.storyboarderscene'
 
           console.log(directoryName)
           // make directory
@@ -3175,7 +3176,7 @@ let loadScene = async (sceneNumber) => {
             defaultBoardTiming: 2000,
             boards: []
           }
-          boardFilename = path.join(currentPath, directoryName, directoryName + '.storyboarder')
+          boardFilename = path.join(currentPath, directoryName, path.basename(directoryName, path.extname(directoryName)) + '.storyboarder')
           boardData = newBoardObject
           fs.writeFileSync(boardFilename, JSON.stringify(newBoardObject, null, 2))
           // make storyboards directory
