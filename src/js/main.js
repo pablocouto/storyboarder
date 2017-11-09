@@ -409,8 +409,21 @@ const findOrCreateProjectFolder = (scriptDataObject) => {
 }
 
 let openDialogue = () => {
-  dialog.showOpenDialog({title:"Open Script", filters:[
-      {name: 'Screenplay or Storyboarder', extensions: ['storyboarder', 'fountain', 'fdx']},
+  dialog.showOpenDialog({
+    properties: [
+      'openDirectory'
+    ],
+    filters: [
+      {
+        name: 'Screenplay or Storyboarder',
+        extensions: [
+          'storyboarderproject',
+          'storyboarderscene',
+          'storyboarder',
+          'fountain',
+          'fdx'
+        ]
+      }
     ]}, (filenames) => {
       if (filenames) {
         openFile(filenames[0])
