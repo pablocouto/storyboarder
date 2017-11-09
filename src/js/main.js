@@ -151,6 +151,10 @@ app.on('ready', () => {
 
     } else {
       console.error('Could not load', filePath)
+      dialog.showErrorBox(
+        'Could not load requested file',
+        `Error loading ${filePath}`
+      )
     }
   }
  
