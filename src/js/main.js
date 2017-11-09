@@ -757,29 +757,50 @@ const ensureFountainSceneIds = (filePath, data) => {
 const createAndLoadScene = aspectRatio =>
   new Promise((resolve, reject) => {
     dialog.showSaveDialog({
-      title: "New storyboard",
+      title: "New Storyboard",
       buttonLabel: "Create",
     },
     async filename => {
       if (filename) {
-        console.log(filename)
-    
-        // TODO test overwriting a folder
+        // replace any extension from the filename
+        filename = path.join(
+          path.dirname(filename),
+          path.basename(filename, path.extname(filename)) + '.storyboarderscene'
+        )
+
+        // console.log('Creating new scene in folder:', path.basename(filename))
         if (fs.existsSync(filename)) {
-          if (fs.lstatSync(filename).isDirectory()) {
-            console.log('\ttrash existing folder', filename)
-            await trash(filename)
+          // NOTE if the user typed in a filename with an extension,
+          //      and it matched an existing filename with an extension, 
+          //      they'll get an OS prompt as well, prior to our prompt
+          const choice = dialog.showMessageBox({
+            type: 'question',
+            buttons: ['Yes', 'No'],
+            title: 'Confirm',
+            message: `Are you absolutely sure? The existing scene ${path.basename(filename, path.extname(filename))} will be overwritten`
+          })
+          
+          const shouldOverwrite = (choice === 0)
+          
+          if (shouldOverwrite) {
+            if (fs.lstatSync(filename).isDirectory()) {
+              console.log('\ttrash existing folder', filename)
+              await trash(filename)
+            } else {
+              dialog.showMessageBox(null, {
+                type: 'error',
+                message: "Could not overwrite file " + path.basename(filename) + ". Only folders can be overwritten." 
+              })
+              return reject(null)
+            }
           } else {
-            dialog.showMessageBox(null, {
-              message: "Could not overwrite file " + path.basename(filename) + ". Only folders can be overwritten." 
-            })
             return reject(null)
           }
         }
 
         fs.mkdirSync(filename)
 
-        let boardName = path.basename(filename)
+        let boardName = path.basename(filename, path.extname(filename))
         let filePath = path.join(filename, boardName + '.storyboarder')
 
         let newBoardObject = {
