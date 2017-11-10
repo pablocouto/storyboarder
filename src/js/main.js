@@ -310,6 +310,35 @@ let openFile = filepath => {
   }
 
   if (extname === '.storyboarder') {
+    // does the project need to be migrated?
+    let needsMigration = true
+    try {
+      if (
+        fs.statSync(
+          path.join(filepath, '..', `${filename}.storyboarderscene`)
+        ).isDirectory()
+      ) {
+        needsMigration = false
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        dialog.showMessageBox({
+          type: 'error',
+          message: error.message
+        })
+      }
+    }
+
+    if (needsMigration) {
+      if (!migrateScene(filepath)) {
+        dialog.showMessageBox({
+          type: 'error',
+          message: 'Could not migrate scene to new format'
+        })
+        return
+      }
+    }
+
     /// LOAD STORYBOARDER FILE
     addToRecentDocs(filepath, {
       boards: 2,
@@ -384,6 +413,14 @@ let openFile = filepath => {
       }
     })
   }
+}
+
+const migrateScene = filepath => {
+  dialog.showMessageBox({
+    message: `Migrating ${path.basename(filepath)} to new format`
+  })
+  
+  return false
 }
 
 const findOrCreateProjectFolder = (scriptDataObject) => {
