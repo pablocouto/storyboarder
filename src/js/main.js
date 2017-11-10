@@ -330,12 +330,21 @@ let openFile = filepath => {
     }
 
     if (needsMigration) {
-      if (!migrateScene(filepath)) {
-        dialog.showMessageBox({
-          type: 'error',
-          message: 'Could not migrate scene to new format'
-        })
-        return
+      const choice = dialog.showMessageBox({
+        type: 'question',
+        buttons: ['Yes', 'No'],
+        message: `This scene was created with an older version of Storyboarder. Would you like to migrate it to the new format now?`
+      })
+
+      // Yes
+      if (choice === 0) {
+        if (!migrateScene(filepath)) {
+          dialog.showMessageBox({
+            type: 'error',
+            message: 'Could not migrate scene to new format'
+          })
+          return
+        }
       }
     }
 
@@ -416,10 +425,6 @@ let openFile = filepath => {
 }
 
 const migrateScene = filepath => {
-  dialog.showMessageBox({
-    message: `Migrating ${path.basename(filepath)} to new format`
-  })
-  
   return false
 }
 
