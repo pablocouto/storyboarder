@@ -100,7 +100,7 @@ const copyProject = (srcFilePath, dstFolderPath) => {
 
   let files = getFilesUsedByProject(srcFilePath)
 
-  let dstBasename = path.basename(dstFolderPath)
+  let dstBasename = path.basename(dstFolderPath, path.extname(dstFolderPath))
   let dstExt = path.extname(srcFilePath)
 
   let pairs = [
