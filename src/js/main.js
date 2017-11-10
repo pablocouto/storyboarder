@@ -29,6 +29,8 @@ const util = require('./utils/index')
 
 const autoUpdater = require('./auto-updater')
 
+const migrateScene = require('./exporters/migrate-scene')
+
 //https://github.com/luiseduardobrito/sample-chat-electron
 
 let welcomeWindow
@@ -265,7 +267,7 @@ let openWelcomeWindow = () => {
   })
 }
 
-let openFile = filepath => {
+let openFile = async filepath => {
   let filename = path.basename(filepath)
   let extname = path.extname(filepath)
 
@@ -338,12 +340,27 @@ let openFile = filepath => {
 
       // Yes
       if (choice === 0) {
-        if (!migrateScene(filepath)) {
+        let newFilepath
+        try {
+          newFilepath = await migrateScene(filepath)
+        } catch (error) {
+          console.error(error)
+          dialog.showMessageBox({
+            type: 'error',
+            message: error.message
+          })
+        }
+
+        if (!newFilepath) {
           dialog.showMessageBox({
             type: 'error',
             message: 'Could not migrate scene to new format'
           })
           return
+
+        } else {
+          // update the filepath (filename and extname remain the same)
+          filepath = newFilepath
         }
       }
     }
@@ -422,10 +439,6 @@ let openFile = filepath => {
       }
     })
   }
-}
-
-const migrateScene = filepath => {
-  return false
 }
 
 const findOrCreateProjectFolder = (scriptDataObject) => {
