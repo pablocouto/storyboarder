@@ -142,10 +142,10 @@ app.on('ready', () => {
   if (isDev && argv[0]) {
     let filePath = path.resolve(argv[0])
     if (fs.existsSync(filePath)) {
-      openFile(filePath)
-
       // HACK prevent upcoming welcomeWindow.show
       welcomeWindow.once('show', () => welcomeWindow.hide())
+
+      openFile(filePath)
 
       return
 
