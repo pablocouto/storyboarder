@@ -138,26 +138,34 @@ app.on('ready', () => {
 
   // open the welcome window when the app loads up first
   openWelcomeWindow()
-  // via https://github.com/electron/electron/issues/4690#issuecomment-217435222
-  const argv = process.defaultApp ? process.argv.slice(2) : process.argv
 
-  //was an argument passed?
-  if (isDev && argv[0]) {
-    let filePath = path.resolve(argv[0])
-    if (fs.existsSync(filePath)) {
-      // HACK prevent upcoming welcomeWindow.show
-      welcomeWindow.once('show', () => welcomeWindow.hide())
+  // TODO why is loading via arg limited to dev mode only?
+  // was an argument passed?
+  if (isDev) {
+    // via https://github.com/electron/electron/issues/4690#issuecomment-217435222
+    const argv = process.defaultApp ? process.argv.slice(2) : process.argv
 
-      openFile(filePath)
+    if (argv[0]) {
+      let filePath = path.resolve(argv[0])
+      if (fs.existsSync(filePath)) {
 
-      return
+        // wait 300 msecs for windows to load
+        setTimeout(() => {
+          openFile(filePath)
+        }, 300)
 
-    } else {
-      console.error('Could not load', filePath)
-      dialog.showErrorBox(
-        'Could not load requested file',
-        `Error loading ${filePath}`
-      )
+        // HACK prevent upcoming welcomeWindow.show
+        welcomeWindow.once('show', () => welcomeWindow.hide())
+
+        return
+
+      } else {
+        console.error('Could not load', filePath)
+        dialog.showErrorBox(
+          'Could not load requested file',
+          `Error loading ${filePath}`
+        )
+      }
     }
   }
  
