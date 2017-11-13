@@ -155,8 +155,7 @@ app.on('ready', () => {
         }, 300)
 
         // HACK prevent upcoming welcomeWindow.show
-        welcomeWindow.once('show', () => welcomeWindow.hide())
-
+        // welcomeWindow.once('show', () => welcomeWindow.hide())
         return
 
       } else {
