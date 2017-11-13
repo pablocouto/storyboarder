@@ -317,7 +317,7 @@ let openFile = async filepath => {
     try {
       if (
         fs.statSync(
-          path.join(filepath, '..', `${filename}.storyboarderscene`)
+          path.join(filepath, '..', `${path.basename(filename, path.extname(filename))}.storyboarderscene`)
         ).isDirectory()
       ) {
         needsMigration = false
