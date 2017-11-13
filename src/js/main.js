@@ -345,7 +345,7 @@ let openFile = async filepath => {
       const choice = dialog.showMessageBox({
         type: 'question',
         buttons: ['Yes', 'No'],
-        message: `This scene was created with an older version of Storyboarder. Would you like to migrate it to the new format now?`
+        message: `This scene was created with an older version of Storyboarder and must be migrated. Would you like to migrate it to the new format now?`
       })
 
       // Yes
@@ -372,6 +372,9 @@ let openFile = async filepath => {
           // update the filepath (filename and extname remain the same)
           filepath = newFilepath
         }
+      } else {
+        // choice === 1
+        return
       }
     }
 
