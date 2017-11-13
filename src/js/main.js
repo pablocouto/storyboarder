@@ -447,7 +447,7 @@ let openFile = async filepath => {
     // is this an existing project in the old format?
     // e.g.: script sibling to storyboards/ folder
     try {
-      isOldProject = !isInProject && fs.statSync(path.join(filepath, 'storyboards')).isDirectory()
+      isOldProject = !isInProject && fs.statSync(path.join(path.dirname(filepath), 'storyboards')).isDirectory()
     } catch (error) {
       // ignore ENOENT and ENOTDIR, warn about others
       if (!(error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
