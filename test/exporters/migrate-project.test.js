@@ -16,6 +16,9 @@ describe('migrate-project', () => {
           'no-parent.fountain': '',
           'storyboards': {
             'storyboarder.settings': '',
+            'Scene-1-INT-HOME-DAY-1-162F0': {
+              'Scene-1-INT-HOME-DAY-1-162F0.storyboarder': ''
+            }
           }
         }
       }
@@ -33,6 +36,9 @@ describe('migrate-project', () => {
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject')))
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards')))
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards', 'storyboarder.settings')))
+
+    // TODO
+    assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards', 'Scene-1-INT-HOME-DAY-1-162F0.storyboarderscene')))
 
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarder')))
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboards')))

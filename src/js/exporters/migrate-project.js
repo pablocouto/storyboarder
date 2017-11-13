@@ -21,6 +21,9 @@ const migrateProject = async (filepath, trashFn = trash) => {
     }
   )
 
+  // rename any storyboarder scenes to .storyboarderscene
+  // TODO
+
   // remove old folders
   await trashFn(path.join(path.dirname(filepath), 'storyboards'))
 }
