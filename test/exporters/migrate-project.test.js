@@ -7,7 +7,7 @@ const migrateProject = require('../../src/js/exporters/migrate-project')
 
 let fixturesPath = path.join(__dirname, '..', 'fixtures')
 
-describe('exporters/copyProject', () => {
+describe('migrate-project', () => {
   before(function () {
     // fake filesystem
     mockFs({

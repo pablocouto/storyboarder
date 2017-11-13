@@ -7,7 +7,7 @@ const migrateScene = require('../../src/js/exporters/migrate-scene')
 
 let fixturesPath = path.join(__dirname, '..', 'fixtures')
 
-describe('exporters/copyProject', () => {
+describe('migrate-scene', () => {
   before(function () {
     // fake filesystem
     mockFs({
