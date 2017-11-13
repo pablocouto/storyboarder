@@ -323,7 +323,8 @@ let openFile = async filepath => {
         needsMigration = false
       }
     } catch (error) {
-      if (error.code !== 'ENOENT') {
+      // ignore ENOENT and ENOTDIR, but log other errors
+      if (!(error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
         dialog.showMessageBox({
           type: 'error',
           message: error.message
