@@ -56,7 +56,7 @@ describe('exporters/common', function () {
   // exporters/common#exportFlattenedBoard
   // used by exporters
   it('can export a thumbnail image, from files, to a file', function(done) {
-    let projectFileAbsolutePath = path.resolve(path.join(fixturesPath, 'example', 'example.storyboarder'))
+    let projectFileAbsolutePath = path.resolve(path.join(fixturesPath, 'example.storyboarderscene', 'example.storyboarder'))
     let project = JSON.parse(fs.readFileSync(projectFileAbsolutePath))
   
     let basenameWithoutExt = path.basename(projectFileAbsolutePath, path.extname(projectFileAbsolutePath))
@@ -88,7 +88,7 @@ describe('exporters/common', function () {
   // exporters/common#exportFlattenedBoard
   // used by exporters
   it('can handle a file no longer existing', function(done) {
-    let projectFileAbsolutePath = path.resolve(path.join(fixturesPath, 'example', 'example.storyboarder'))
+    let projectFileAbsolutePath = path.resolve(path.join(fixturesPath, 'example.storyboarderscene', 'example.storyboarder'))
     let project = JSON.parse(fs.readFileSync(projectFileAbsolutePath))
   
     let basenameWithoutExt = path.basename(projectFileAbsolutePath, path.extname(projectFileAbsolutePath))
