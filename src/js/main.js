@@ -337,6 +337,7 @@ let openFile = async filepath => {
           type: 'error',
           message: error.message
         })
+        return
       }
     }
 
@@ -440,6 +441,7 @@ let openFile = async filepath => {
           type: 'error',
           message: error.message
         })
+        return
       }
     }
 
@@ -454,6 +456,7 @@ let openFile = async filepath => {
           type: 'error',
           message: error.message
         })
+        return
       }
     }
 
