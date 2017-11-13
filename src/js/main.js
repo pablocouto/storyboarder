@@ -385,46 +385,6 @@ let openFile = async filepath => {
     })
     loadStoryboarderWindow(filepath)
 
-  } else if (extname === '.fdx') {
-    fs.readFile(filepath, 'utf-8', (err, data) => {
-      if (err) {
-        dialog.showMessageBox({
-          type: 'error',
-          message: 'Could not open Final Draft file.\n' + error.message,
-        })
-        return
-      }
-      let parser = new xml2js.Parser()
-      parser.parseString(data, (err, fdxObj) => {
-        if (err) {
-          dialog.showMessageBox({
-            type: 'error',
-            message: 'Could not parse Final Draft XML.\n' + error.message,
-          })
-          return
-        }
-
-        currentFile = filepath
-        currentPath = path.join(path.dirname(currentFile), 'storyboards')
-
-        try {
-          let [scriptData, locations, characters, metadata] = processFdxData(fdxObj)
-
-          findOrCreateProjectFolder([
-            scriptData,
-            locations,  
-            characters,
-            metadata
-          ])
-        } catch (error) {
-          console.error(error)
-          dialog.showMessageBox({
-            type: 'error',
-            message: 'Could not parse Final Draft data.\n' + error.message
-          })
-        }
-      })
-    })
   } else if (extname == '.fountain' || extname == '.fdx') {
     let isInProject,
         isOldProject,
@@ -501,27 +461,69 @@ let openFile = async filepath => {
     }
 
     // ok, we know about the project. now try to read it
-    fs.readFile(filepath, 'utf-8', (err, data) => {
-      if (err) {
-        dialog.showMessageBox({
-          type: 'error',
-          message: 'Could not read Fountain script.\n' + err.message,
+    if (extname === '.fdx') {
+      fs.readFile(filepath, 'utf-8', (err, data) => {
+        if (err) {
+          dialog.showMessageBox({
+            type: 'error',
+            message: 'Could not open Final Draft file.\n' + error.message,
+          })
+          return
+        }
+        let parser = new xml2js.Parser()
+        parser.parseString(data, (err, fdxObj) => {
+          if (err) {
+            dialog.showMessageBox({
+              type: 'error',
+              message: 'Could not parse Final Draft XML.\n' + error.message,
+            })
+            return
+          }
+
+          currentFile = filepath
+          currentPath = path.join(path.dirname(currentFile), 'storyboards')
+
+          try {
+            let [scriptData, locations, characters, metadata] = processFdxData(fdxObj)
+
+            findOrCreateProjectFolder([
+              scriptData,
+              locations,  
+              characters,
+              metadata
+            ])
+          } catch (error) {
+            console.error(error)
+            dialog.showMessageBox({
+              type: 'error',
+              message: 'Could not parse Final Draft data.\n' + error.message
+            })
+          }
         })
-        return
-      }
-      try {
-        data = ensureFountainSceneIds(filepath, data)
-        findOrCreateProjectFolder(
-          processFountainData(data, true, false)
-        )
-      } catch (error) {
-        console.error(error)
-        dialog.showMessageBox({
-          type: 'error',
-          message: 'Could not parse Fountain script.\n' + error.message,
-        })
-      }
-    })
+      })
+    } else if (extname === '.fountain') {
+      fs.readFile(filepath, 'utf-8', (err, data) => {
+        if (err) {
+          dialog.showMessageBox({
+            type: 'error',
+            message: 'Could not read Fountain script.\n' + err.message,
+          })
+          return
+        }
+        try {
+          data = ensureFountainSceneIds(filepath, data)
+          findOrCreateProjectFolder(
+            processFountainData(data, true, false)
+          )
+        } catch (error) {
+          console.error(error)
+          dialog.showMessageBox({
+            type: 'error',
+            message: 'Could not parse Fountain script.\n' + error.message,
+          })
+        }
+      })
+    }
   }
 }
 
