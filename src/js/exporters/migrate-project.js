@@ -8,8 +8,8 @@ const migrateProject = async (filepath, trashFn = trash) => {
 
   fs.ensureDirSync(path.join(projectpath, 'storyboards'))
 
-  // copy script
-  fs.copySync(filepath, newFilepath)
+  // don't move the script
+  // fs.copySync(filepath, path.join(path.dirname(newFilepath), '..'))
 
   // copy storyboards + storyboarder.settings
   fs.copySync(
@@ -21,11 +21,8 @@ const migrateProject = async (filepath, trashFn = trash) => {
     }
   )
 
-  // remove old files and folders
-  await trashFn(filepath)
+  // remove old folders
   await trashFn(path.join(path.dirname(filepath), 'storyboards'))
-
-  return newFilepath
 }
 
 module.exports = migrateProject

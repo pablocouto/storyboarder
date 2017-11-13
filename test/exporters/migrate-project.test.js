@@ -26,19 +26,18 @@ describe('migrate-project', () => {
     // simulate the trash fn so we can use it with mockFs
     const trashFn = async filename => fs.removeSync(filename)
 
-    let filepath = path.join(fixturesPath, 'no-parent', 'no-parent.fountain')
+    await migrateProject(path.join(fixturesPath, 'no-parent', 'no-parent.fountain'), trashFn)
 
-    let result = await migrateProject(filepath, trashFn)
-    assert.equal(result, path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'no-parent.fountain'))
-    
+    // script file stays in place
+    assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.fountain')))
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject')))
-    assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'no-parent.fountain')))
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards')))
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards', 'storyboarder.settings')))
 
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarder')))
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboarder')))
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboarder', 'storyboarder.settings')))
+    assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarder', 'no-parent.fountain')))
   })
 
   after(function () {
