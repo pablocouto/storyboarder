@@ -35,8 +35,8 @@ describe('migrate-project', () => {
     assert(fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarderproject', 'storyboards', 'storyboarder.settings')))
 
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarder')))
-    assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboarder')))
-    assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboarder', 'storyboarder.settings')))
+    assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboards')))
+    assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'storyboards', 'storyboarder.settings')))
     assert(!fs.existsSync(path.join(fixturesPath, 'no-parent', 'no-parent.storyboarder', 'no-parent.fountain')))
   })
 
