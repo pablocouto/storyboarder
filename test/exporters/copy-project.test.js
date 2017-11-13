@@ -17,11 +17,7 @@ const exporterCopyProject = require('../../src/js/exporters/copy-project')
 let fixturesPath = path.join(__dirname, '..', 'fixtures')
 
 describe('exporters/copyProject', () => {
-  describe('copy from old format', () => {
-    // TODO detect old format and fail to allow copying until migrated
-  })
-
-  describe('copy from new format', () => {
+  describe('can make a copy of a project from its referenced files', () => {
     before(function () {
       // fake filesystem
       // clone some actual files to use as source material
