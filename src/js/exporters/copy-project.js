@@ -33,16 +33,16 @@ const getAllAbsoluteFilePathsUsedByScene = srcFilePath => {
 
 // srcFilePath: absolute path to project file (.storyboarder or .fountain/.fdx)
 const getFilesUsedByProject = srcFilePath => {
-  // for convenience
-  let srcFolderPath = path.dirname(srcFilePath)
-
   // is this a multi-scene project?
   const isMultiScene = (path.extname(srcFilePath) === '.fountain' || path.extname(srcFilePath) === '.fdx')
 
   if (isMultiScene) {
     let files = []
 
-    // .fountain file
+    let projectFileName = path.basename(srcFilePath, path.extname(srcFilePath)) + '.storyboarderproject'
+    let srcFolderPath = path.join(path.dirname(srcFilePath), projectFileName)
+
+    // NOTE .fountain file is not included, so we don't run the following
     // files.push(srcFilePath)
 
     if (
@@ -75,6 +75,7 @@ const getFilesUsedByProject = srcFilePath => {
 
     return files
   } else {
+    let srcFolderPath = path.dirname(srcFilePath)
     return getAllAbsoluteFilePathsUsedByScene(srcFilePath)
   }
 }
