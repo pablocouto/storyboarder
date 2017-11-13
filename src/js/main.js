@@ -474,28 +474,19 @@ let openFile = async filepath => {
       if (choice === 0) {
         let newFilepath
         try {
-          newFilepath = await migrateProject(filepath)
+          await migrateProject(filepath)
         } catch (error) {
           console.error(error)
           dialog.showMessageBox({
             type: 'error',
-            message: error.message
-          })
-        }
-
-        if (!newFilepath) {
-          dialog.showMessageBox({
-            type: 'error',
-            message: 'Could not migrate project to new format'
+            message: 'Could not migrate project to new format\n' + error.message
           })
           return
-
-        } else {
-          // update the filepath (filename and extname remain the same)
-          filepath = newFilepath
-          currentFile = newFilepath
-          currentPath = path.join(path.dirname(newFilepath), 'storyboards')
         }
+
+        // script path does not change
+        currentFile = filepath
+        currentPath = path.join(path.dirname(filepath), path.basename(filepath, path.extname(filepath)) + '.storyboarderproject', 'storyboards')
       } else {
         return
       }
