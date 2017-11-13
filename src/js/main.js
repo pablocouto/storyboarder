@@ -30,6 +30,7 @@ const util = require('./utils/index')
 const autoUpdater = require('./auto-updater')
 
 const migrateScene = require('./exporters/migrate-scene')
+const migrateProject = require('./exporters/migrate-project')
 
 //https://github.com/luiseduardobrito/sample-chat-electron
 
@@ -413,11 +414,87 @@ let openFile = async filepath => {
         }
       })
     })
+  } else if (extname == '.fountain' || extname == '.fdx') {
+    let isInProject,
+        isOldProject,
+        isNotProject
 
-  } else if (extname == '.fountain') {
-    currentFile = filepath
-    currentPath = path.join(path.dirname(currentFile), 'storyboards')
+    // is this an existing project in the new format?
+    // e.g.: script sibling to .storyboarderproject
+    try {
+      isInProject = fs.statSync(path.join(filepath, '..', `${path.basename(filename, path.extname(filename))}.storyboarderproject`)).isDirectory()
+    } catch (error) {
+      // ignore ENOENT and ENOTDIR, warn about others
+      if (!(error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+        dialog.showMessageBox({
+          type: 'error',
+          message: error.message
+        })
+      }
+    }
 
+    // is this an existing project in the old format?
+    // e.g.: script sibling to storyboards/ folder
+    try {
+      isOldProject = !isInProject && fs.statSync(path.join(filepath, 'storyboards')).isDirectory()
+    } catch (error) {
+      // ignore ENOENT and ENOTDIR, warn about others
+      if (!(error.code === 'ENOENT' || error.code === 'ENOTDIR')) {
+        dialog.showMessageBox({
+          type: 'error',
+          message: error.message
+        })
+      }
+    }
+
+    // is this a new project?
+    isNotProject = !(isInProject || isOldProject)
+
+    if (isOldProject) {
+      const choice = dialog.showMessageBox({
+        type: 'question',
+        buttons: ['Yes', 'No'],
+        message: `This project was created with an older version of Storyboarder. Would you like to migrate it to the new format now?`
+      })
+
+      // Yes
+      if (choice === 0) {
+        let newFilepath
+        try {
+          newFilepath = await migrateProject(filepath)
+        } catch (error) {
+          console.error(error)
+          dialog.showMessageBox({
+            type: 'error',
+            message: error.message
+          })
+        }
+
+        if (!newFilepath) {
+          dialog.showMessageBox({
+            type: 'error',
+            message: 'Could not migrate project to new format'
+          })
+          return
+
+        } else {
+          // update the filepath (filename and extname remain the same)
+          filepath = newFilepath
+          currentFile = newFilepath
+          currentPath = path.join(path.dirname(newFilepath), 'storyboards')
+        }
+      }
+    } else if (isNotProject) {
+      currentFile = filepath
+      currentPath = path.join(path.dirname(filepath), 'storyboards')
+
+    } else if (isInProject) {
+      currentFile = filepath
+      currentPath = path.join(path.dirname(filepath), 'storyboards')
+
+    }
+
+    // ok, we know about the project. now try to read it
     fs.readFile(filepath, 'utf-8', (err, data) => {
       if (err) {
         dialog.showMessageBox({
