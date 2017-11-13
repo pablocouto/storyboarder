@@ -465,7 +465,7 @@ let openFile = async filepath => {
       const choice = dialog.showMessageBox({
         type: 'question',
         buttons: ['Yes', 'No'],
-        message: `This project was created with an older version of Storyboarder. Would you like to migrate it to the new format now?`
+        message: `This scene was created with an older version of Storyboarder and must be migrated. Would you like to migrate it to the new format now?`
       })
 
       // Yes
@@ -494,6 +494,8 @@ let openFile = async filepath => {
           currentFile = newFilepath
           currentPath = path.join(path.dirname(newFilepath), 'storyboards')
         }
+      } else {
+        return
       }
     } else if (isNotProject) {
       currentFile = filepath
