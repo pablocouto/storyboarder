@@ -1185,6 +1185,9 @@ ipcMain.on('exportImages', (event, arg) => {
 ipcMain.on('exportPDF', (event, arg) => {
   mainWindow.webContents.send('exportPDF', arg)
 })
+ipcMain.on('exportWeb', (event, arg) => {
+  mainWindow.webContents.send('exportWeb', arg)
+})
 ipcMain.on('exportZIP', (event, arg) => {
   mainWindow.webContents.send('exportZIP', arg)
 })
