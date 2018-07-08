@@ -11,8 +11,8 @@ const Color = require('color-js')
 const chokidar = require('chokidar')
 const plist = require('plist')
 const R = require('ramda')
+const CAF = require('caf')
 const isDev = require('electron-is-dev')
-
 
 const { getInitialStateRenderer } = require('electron-redux')
 const configureStore = require('../shared/store/configureStore')
@@ -20,6 +20,8 @@ const observeStore = require('../shared/helpers/observeStore')
 
 
 const StoryboarderSketchPane = require('./storyboarder-sketch-pane')
+const { SketchPane } = require('alchemancy')
+const SketchPaneUtil = require('alchemancy').util
 const undoStack = require('../undo-stack')
 
 const Toolbar = require('./toolbar')
@@ -34,8 +36,10 @@ const Guides = require('./guides')
 const OnionSkin = require('./onion-skin')
 const Sonifier = require('./sonifier/index')
 const LayersEditor = require('./layers-editor')
+const DiagnosticsView = require('./diagnostics-view')
 const sfx = require('../wonderunit-sound')
-const { createIsCommandPressed } = require('../utils/keytracker')
+const keytracker = require('../utils/keytracker')
+const createIsCommandPressed = keytracker.createIsCommandPressed
 const SceneTimelineView = require('./scene-timeline-view')
 
 const storyTips = new(require('./story-tips'))(sfx, notifications)
@@ -43,17 +47,16 @@ const exporter = require('./exporter')
 const exporterCommon = require('../exporters/common')
 const exporterCopyProject = require('../exporters/copy-project')
 const exporterArchive = require('../exporters/archive')
+const exporterWeb = require('../exporters/web')
+const exporterPsd = require('../exporters/psd')
 
-const prefsModule = require('electron').remote.require('./prefs')
-prefsModule.init(path.join(app.getPath('userData'), 'pref.json'))
+const importerPsd = require('../importers/psd')
 
 const sceneSettingsView = require('./scene-settings-view')
 
 const boardModel = require('../models/board')
 
 const FileHelper = require('../files/file-helper')
-const readPsd = require('ag-psd').readPsd;
-const initializeCanvas = require('ag-psd').initializeCanvas;
 
 const ShotTemplateSystem = require('../shot-template-system')
 const StsSidebar = require('./sts-sidebar')
@@ -70,15 +73,16 @@ const store = configureStore(getInitialStateRenderer(), 'renderer')
 window.$r = { store } // for debugging, e.g.: $r.store.getStore()
 const isCommandPressed = createIsCommandPressed(store)
 
-
-const {
-  LAYER_INDEX_REFERENCE,
-  LAYER_INDEX_MAIN,
-  LAYER_INDEX_NOTES,
-  LAYER_INDEX_COMPOSITE,
-
-  LAYER_NAME_BY_INDEX
-} = require('../constants')
+const prefsModule = require('electron').remote.require('./prefs')
+prefsModule.init(path.join(app.getPath('userData'), 'pref.json'))
+// we're gradually migrating prefs to a reducer
+// we read any 2.0 toolbar related prefs into the toolbar reducer manually
+// NOTE this is async so preferences will be invalid until main IPC dispatches back to renderers
+if (prefsModule.getPrefs().toolbar) {
+  store.dispatch({
+    type: 'TOOLBAR_MERGE_FROM_PREFERENCES', payload: prefsModule.getPrefs()
+  })
+}
 
 const CanvasRecorder = require('../recording/canvas-recorder')
 const moment = require('moment')
@@ -113,13 +117,6 @@ const ALLOWED_AUDIO_FILE_EXTENSIONS = [
   'mp4'
 ]
 
-let layerStatus = {
-  [LAYER_INDEX_REFERENCE]:  { dirty: false },
-  [LAYER_INDEX_MAIN]:       { dirty: false },
-  [LAYER_INDEX_NOTES]:      { dirty: false },
-
-  [LAYER_INDEX_COMPOSITE]:  { dirty: false } // TODO do we need this?
-}
 let imageFileDirtyTimer
 let isSavingImageFile = false // lock for saveImageFile
 
@@ -163,32 +160,50 @@ let timelineModeControlView
 
 let storyboarderSketchPane
 
+let exportWebWindow
+
 let dragMode = false
 let preventDragMode = false
 let dragPoint
 let dragTarget
 let scrollPoint
 
+// CAF cancel tokens for async functions
+let cancelTokens = {}
+
 const msecsToFrames = value => Math.round(value / 1000 * boardData.fps)
 const framesToMsecs = value => Math.round(value / boardData.fps * 1000)
 
 // TODO better name than etags?
 // TODO store in boardData instead, but exclude from JSON?
+// TODO use mtime trick like we do for layers and posterframes?
 // cache buster for thumbnails
 let etags = {}
 const setEtag = absoluteFilePath => { etags[absoluteFilePath] = Date.now() }
 const getEtag = absoluteFilePath => etags[absoluteFilePath] || '0'
 
-let srcByUid = {}
+const cacheKey = filepath => {
+  try {
+    // file exists, cache based on mtime
+    return fs.statSync(filepath).mtimeMs
+  } catch (err) {
+    // file not found, cache buster based on current time
+    return Date.now()
+  }
+}
+
+let srcByUid = {} // TODO review, was used for setThumbnailDisplayAsPending, do we still need it?
 let shouldRenderThumbnailDrawer = true
 
 //  analytics.event('Application', 'open', filename)
 
+// flag set after we've warned about FPS at least once since this window opened
+let hasWarnedOnceAboutFps = false
 
 remote.getCurrentWindow().on('focus', () => {
   menu.setMenu()
   // HACK update to reflect current value
-  audioPlayback.setEnableAudition(audioPlayback.enableAudition)
+  audioPlayback && audioPlayback.setEnableAudition(audioPlayback.enableAudition)
 })
 
 ///////////////////////////////////////////////////////////////
@@ -212,6 +227,10 @@ const load = async (event, args) => {
       currentPath = args[5]
 
       await updateSceneFromScript()
+      store.dispatch({
+        type: 'SCENE_FILE_LOADED',
+        payload: { path: boardFilename }
+      })
     } else {
       log({ type: 'progress', message: 'Loading Project File' })
       // if not, its just a simple single boarder file
@@ -223,12 +242,19 @@ const load = async (event, args) => {
       try {
         boardData = JSON.parse(fs.readFileSync(boardFilename))
         ipcRenderer.send('analyticsEvent', 'Application', 'open', boardFilename, boardData.boards.length)
+
+        store.dispatch({
+          type: 'SCENE_FILE_LOADED',
+          payload: { path: boardFilename }
+        })
       } catch (error) {
         throw new Error(`Could not read file ${path.basename(boardFilename)}. The file may be inaccessible or corrupt.\nError: ${error.message}`)
       }
     }
 
-    loadBoardUI()
+    migrateScene()
+
+    await loadBoardUI()
     await updateBoardUI()
 
     verifyScene()
@@ -236,17 +262,89 @@ const load = async (event, args) => {
     log({ type: 'progress', message: 'Preparing to display' })
 
     resize()
-    setTimeout(() => {
-      storyboarderSketchPane.resize()
+    // storyboarderSketchPane.resize()
+    await new Promise(resolve => setTimeout(resolve, 50)) // wait for the DOM to catch up to avoid FOUC
 
-      setImmediate(() =>
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() =>
-            ipcRenderer.send('workspaceReady')
-          )
-        )
-      )
-    }, 500) // TODO hack, remove this #440
+    ipcRenderer.send('workspaceReady')
+
+    let win = remote.getCurrentWindow()
+    win.webContents.addListener('before-input-event', (event, input) => {
+      // TODO need a different fix for dev tools, which doesn't have before-input-event
+      // see: https://github.com/wonderunit/storyboarder/issues/1202
+
+      //
+      //
+      // intercept some key commands
+      //
+      // TODO avoid key doubling where Menu still tries to send the command
+      // see: https://github.com/wonderunit/storyboarder/issues/1206
+      //
+      // construct a unique set of keys including the one JUST intercepted
+      let pressedKeys = [...new Set([...keytracker.pressed(), input.key])]
+      //
+      // intercept: New Board (IPC: newBoard)
+      if (isCommandPressed('menu:boards:new-board', pressedKeys)) {
+        // keyDown triggers newBoard
+        if (input.type == 'keyDown') {
+          // sanity check
+          if (!textInputMode) {
+            // manually construct a new board
+            newBoard()
+              .then(index => {
+                // go to the board
+                gotoBoard(index)
+                // report
+                ipcRenderer.send('analyticsEvent', 'Board', 'new')
+              })
+              .catch(err => console.error(err))
+          }
+        }
+
+        // keyUp AND keyDown cause menu to be ignored and key to be trapped
+        win.webContents.setIgnoreMenuShortcuts(true)
+        event.preventDefault()
+        return
+      }
+
+      // intercept: Change Tool (IPC: setTool)
+      // e.g.: '1'-'6' shouldn't flash the menu
+      for (let [command, toolName] of [
+        ['menu:tools:light-pencil', 'light-pencil'],
+        ['menu:tools:brush', 'brush'],
+        ['menu:tools:tone', 'tone'],
+        ['menu:tools:pencil', 'pencil'],
+        ['menu:tools:pen', 'pen'],
+        ['menu:tools:note-pen', 'note-pen'],
+        ['menu:tools:eraser', 'eraser']
+      ]) {
+        if (isCommandPressed(command, pressedKeys)) {
+          if (input.type == 'keyDown' &&
+              !textInputMode &&
+              !storyboarderSketchPane.getIsDrawingOrStabilizing()
+          ) {
+            store.dispatch({
+              type: 'TOOLBAR_TOOL_CHANGE',
+              payload: toolName,
+              meta: { scope: 'local' }
+            })
+          }
+
+          win.webContents.setIgnoreMenuShortcuts(true)
+          event.preventDefault()
+          return
+        }
+      }
+
+      // if we're in text input mode, and have not pressed Control or Meta
+      if (textInputMode && !(input.control || input.meta)) {
+        // ignore any key that might trigger the menu
+        win.webContents.setIgnoreMenuShortcuts(true)
+      } else {
+        // otherwise, allow it through
+        win.webContents.setIgnoreMenuShortcuts(false)
+      }
+    })
+
   } catch (error) {
     console.error(error)
 
@@ -447,6 +545,96 @@ const commentOnLineMileage = (miles) => {
   notifications.notify({message: message.join(' '), timing: 10})
 }
 
+// TODO this is really similar to verifyScene, but verifyScene requires the UI to be ready (for notifications)
+const migrateScene = () => {
+  let boardImagesPath = path.join(boardPath, 'images')
+
+  // if at least one board.url file exists, consider this an old project
+  let needsMigration = false
+  for (let board of boardData.boards) {
+    if (fs.existsSync(path.join(boardImagesPath, board.url))) {
+      if (!(board.layers && board.layers.fill)) {
+        // needs to be migrated
+        needsMigration = true
+        break
+      }
+    }
+  }
+
+  if (!needsMigration) return false
+
+  // is this scene itself a migrated backup?
+  let foldername = path.dirname(boardFilename)
+  // does the basename end with `-backup`?
+  let foldernameContainsStringBackup = foldername.match(/-backup$/i) != null
+  // is this a backup folder alongside the original?
+  let calculatedOriginalFilename = foldername.replace(/-backup$/i, '')
+  let isAlongside = fs.existsSync(calculatedOriginalFilename)
+  if (foldernameContainsStringBackup && isAlongside) {
+    // we don't need to migrate
+    remote.dialog.showMessageBox({
+      message: "This appears to be a backup of a scene created with an older version of Storyboarder. It will not be migrated. Some layers won’t appear correctly in this version of Storyboarder."
+    })
+    return false
+  }
+
+  // make a backup
+  let src = boardFilename
+  let dst = path.join(path.dirname(boardFilename), '..',
+    path.basename(boardFilename, path.extname(boardFilename)) + '-backup')
+  if (fs.existsSync(dst)) {
+    remote.dialog.showMessageBox({
+      type: 'error',
+      message: `Tried to migrate scene to new Storyboarder format but a backup already exists.\n\n${dst}\n\nPlease move or rename the backup folder and retry.`
+    })
+    window.close()
+    throw new Error('Could not migrate')
+    return false
+  }
+
+  fs.ensureDirSync(dst)
+  console.log('Preparing to migrate scene to new Storyboarder layers format')
+  console.log('Making a backup before migrating …')
+  exporterCopyProject.copyProject(
+    src,
+    dst,
+    {
+      // copy board url main images
+      copyBoardUrlMainImages: true,
+      // ignore missing files, like posterframes or thumbnails
+      ignoreMissing: true
+    })
+
+  // upgrade to the 1.6 layers format
+  // see: https://github.com/wonderunit/storyboarder/issues/1160
+  for (let board of boardData.boards) {
+    // if a file exists for the board.url, we haven't migrated yet
+    if (fs.existsSync(path.join(boardImagesPath, board.url))) {
+      // catch edge case where fill layer already exists
+      if (board.layers && board.layers.fill) {
+        console.warn('Found an old main layer but fill already exists')
+        remote.dialog.showMessageBox({
+          type: 'error',
+          message: 'Error while migrating board: fill layer already exists'
+        })
+      } else {
+        // ensure board.layers exists
+        if (!board.layers) {
+          board.layers = {}
+        }
+        // move main layer to fill layer
+        let filename = boardModel.boardFilenameForLayer(board, 'fill')
+        console.log(`Moving ${board.url} to new fill layer ${filename}`)
+        fs.moveSync(path.join(boardImagesPath, board.url), path.join(boardImagesPath, filename))
+        board.layers.fill = {
+          url: filename
+        }
+        markBoardFileDirty()
+      }
+    }
+  }
+}
+
 // NOTE we assume that all resources (board data and images) are saved BEFORE calling verifyScene
 const verifyScene = () => {
   // find all used files
@@ -504,25 +692,32 @@ const verifyScene = () => {
   }
 }
 
-let loadBoardUI = () => {
+const loadBoardUI = async () => {
   log({ type: 'progress', message: 'Loading User Interface' })
 
   let size = boardModel.boardFileImageSize(boardData)
 
   shotTemplateSystem = new ShotTemplateSystem({ width: size[0], height: size[1] })
 
+  if (!SketchPane.canInitialize()) {
+    remote.dialog.showMessageBox({
+      type: 'error',
+      message: 'Sorry, Storyboarder is not supported on your device because WebGL could not be initialized.'
+    })
+    window.close()
+    return
+  }
+
   storyboarderSketchPane = new StoryboarderSketchPane(
     document.getElementById('storyboarder-sketch-pane'),
     size,
     store
   )
-  
+  await storyboarderSketchPane.load()
+
   window.addEventListener('resize', () => {
     resize()
-    // this is pretty hacky.
-    setTimeout(() => storyboarderSketchPane.resize(), 500) // TODO hack, remove this #440
-    setTimeout(() => storyboarderSketchPane.resize(), 1000) // TODO hack, remove this #440
-    setTimeout(() => storyboarderSketchPane.resize(), 1100) // TODO hack, remove this #440
+    // storyboarderSketchPane.resize()
   })
 
   window.ondragover = () => { return false }
@@ -574,6 +769,7 @@ let loadBoardUI = () => {
   }
 
   storyboarderSketchPane.on('addToUndoStack', layerIndices => {
+    clearTimeout(drawIdleTimer)
     storeUndoStateForImage(true, layerIndices)
   })
 
@@ -581,27 +777,36 @@ let loadBoardUI = () => {
     storeUndoStateForImage(false, layerIndices)
     markImageFileDirty(layerIndices)
 
-    // save progress image
-    if(isRecording) {
-      let snapshotCanvases = [
-        storyboarderSketchPane.sketchPane.getLayerCanvas(0),
-        storyboarderSketchPane.sketchPane.getLayerCanvas(1),
-        storyboarderSketchPane.sketchPane.getLayerCanvas(3),
-      ]
-      canvasRecorder.capture(snapshotCanvases)
-      if(!isRecordingStarted) isRecordingStarted = true
+    // TODO performance pass. this is slow!
+    //      see: https://github.com/wonderunit/storyboarder/issues/1193
+    if (isRecording) {
+      // grab full-size image from current sketchpane (in memory)
+      let pixels = storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+        storyboarderSketchPane.sketchPane.width,
+        storyboarderSketchPane.sketchPane.height,
+        storyboarderSketchPane.visibleLayersIndices
+      )
+      // un-premultiply
+      SketchPaneUtil.arrayPostDivide(pixels)
+      // send as a canvas
+      canvasRecorder.capture([
+        SketchPaneUtil.pixelsToCanvas(
+          pixels,
+          storyboarderSketchPane.sketchPane.width,
+          storyboarderSketchPane.sketchPane.height
+        )
+      ])
+      if (!isRecordingStarted) isRecordingStarted = true
     }
-  })
-  storyboarderSketchPane.on('pointerdown', () => {
-    clearTimeout(drawIdleTimer)
-  })
 
-  // this is essentially pointerup
-  storyboarderSketchPane.on('lineMileage', value => {
-    addToLineMileage(value)
     drawIdleTimer = setTimeout(onDrawIdle, 500)
   })
+  // storyboarderSketchPane.on('pointerdown', () => {
+  //   clearTimeout(drawIdleTimer)
+  // })
 
+  storyboarderSketchPane.on('lineMileage', value =>
+    addToLineMileage(value))
 
 
   let sketchPaneEl = document.querySelector('#storyboarder-sketch-pane')
@@ -647,20 +852,40 @@ let loadBoardUI = () => {
     item.addEventListener('input', e => {
       switch (e.target.name) {
         case 'duration':
-          document.querySelector('input[name="frames"]').value = msecsToFrames(Number(e.target.value))
+          // if we can't parse the value as a number (e.g.: empty string),
+          // set to undefined
+          // which will render as the scene's default duration
+          let newDuration = isNaN(parseInt(e.target.value, 10))
+            ? undefined
+            : e.target.value
 
+          // set the new duration value
           for (let index of selections) {
-            boardData.boards[index].duration = Number(e.target.value)
+            boardData.boards[index].duration = newDuration
           }
+
+          // update the `frames` view
+          document.querySelector('input[name="frames"]').value = msecsToFrames(boardModel.boardDuration(boardData, boardData.boards[currentBoard]))
+
           renderThumbnailDrawer()
           renderMarkerPosition()
           break
         case 'frames':
-          document.querySelector('input[name="duration"]').value = framesToMsecs(Number(e.target.value))
+          let newFrames = isNaN(parseInt(e.target.value, 10))
+            ? undefined
+            : e.target.value
 
           for (let index of selections) {
-            boardData.boards[index].duration = framesToMsecs(Number(e.target.value))
+            boardData.boards[index].duration = newFrames != null
+              ? framesToMsecs(newFrames)
+              : undefined
           }
+
+          // update the `duration` view
+          document.querySelector('input[name="duration"]').value = newFrames != null
+            ? framesToMsecs(newFrames)
+            : ''
+
           renderThumbnailDrawer()
           renderMarkerPosition()
           break
@@ -702,6 +927,26 @@ let loadBoardUI = () => {
     }
   })
 
+  // toggle scroll-indicator visibility based on scroll position
+  const renderScrollIndicator = () => {
+    let target = document.querySelector('.board-metadata-container')
+    let el = document.querySelector('#board-metadata .scroll-indicator')
+    if (target.offsetHeight + target.scrollTop === target.scrollHeight) {
+      el.style.opacity = 0
+    } else {
+      el.style.opacity = 1.0
+    }
+  }
+  document.querySelector('.board-metadata-container').addEventListener('scroll', () => renderScrollIndicator())
+  document.querySelector('#board-metadata .scroll-indicator').addEventListener('click', e => {
+    let el = document.querySelector('.board-metadata-container')
+    el.scrollTo({
+      top: el.scrollHeight,
+      behavior: 'smooth'
+    })
+  })
+  window.addEventListener('resize', () => renderScrollIndicator())
+  renderScrollIndicator() // initialize
 
   for (var item of document.querySelectorAll('.board-metadata-container input, .board-metadata-container textarea')) {
     item.addEventListener('pointerdown', (e)=>{
@@ -710,19 +955,55 @@ let loadBoardUI = () => {
       dragTarget.style.scrollBehavior = 'smooth'
     })
   }
-
   
+  document.querySelector('#suggested-dialogue-duration').addEventListener('pointerdown', (e)=>{
+    let board = boardData.boards[currentBoard]
+    board.duration = e.target.dataset.duration
+    renderMetaData()
+  })
+
     
     // for (var item of document.querySelectorAll('.thumbnail')) {
     //   item.classList.remove('active')
     // }
 
 
-
-  document.querySelector('#show-in-finder-button').addEventListener('pointerdown', (e)=>{
+  const getActiveLayerFilePath = () => {
     let board = boardData.boards[currentBoard]
-    let imageFilename = path.join(boardPath, 'images', board.url)
-    shell.showItemInFolder(imageFilename)
+    let state = store.getState()
+    if (state.toolbar.activeTool !== 'eraser') {
+      let filename = boardModel.boardFilenameForLayer(board, state.toolbar.tools[state.toolbar.activeTool].defaultLayerName)
+      let filepath = path.join(boardPath, 'images', filename)
+      try {
+        if (fs.statSync(filepath).isFile()) {
+          return filepath
+        }
+      } catch (err) {
+        if (err.code !== 'ENOENT') {
+          throw err
+        }
+      }
+    }
+  }
+  document.querySelector('#show-in-finder-button').addEventListener('pointerdown', event => {
+    let filepath = getActiveLayerFilePath()
+    if (filepath) {
+      console.log('revealing', filepath)
+      shell.showItemInFolder(filepath)
+    } else {
+      // TODO find the first existing layer? see: https://github.com/wonderunit/storyboarder/issues/1173
+
+      // e.g.: `eraser`, or a layer image that hasn't save yet
+      console.log('could not find image file for current layer')
+
+      // uncomment to warn artist first
+      // remote.dialog.showMessageBox({
+      //   message: 'This layer does not have an image file yet. It may be empty, or in the process of saving. Please choose a different layer to show.'
+      // })
+
+      // just show the images folder
+      shell.showItemInFolder(path.join(boardPath, 'images'))
+    }
   })
 
   window.addEventListener('pointermove', (e)=>{
@@ -799,65 +1080,10 @@ let loadBoardUI = () => {
     }
   })
 
-  toolbar = new Toolbar(document.getElementById("toolbar"))
-  toolbar.on('brush', (kind, options) => {
-    toolbar.emit('cancelTransform')
-    storyboarderSketchPane.setBrushTool(kind, options)
-    sfx.playEffect('tool-' + kind)
-  })
-  toolbar.on('brush:size', size => {
-    toolbar.emit('cancelTransform')
-    storyboarderSketchPane.setBrushSize(size)
-  })
-  toolbar.on('brush:color', color => {
-    toolbar.emit('cancelTransform')
-    sfx.playEffect('metal')
-    storyboarderSketchPane.setBrushColor(color)
-  })
-
-
+  toolbar = new Toolbar(store, document.getElementById('toolbar'))
   toolbar.on('trash', () => {
     clearLayers()
   })
-
-
-  toolbar.on('move', () => {
-    if (storyboarderSketchPane.isPointerDown) return
-      sfx.playEffect('metal')
-    toolbar.setState({ transformMode: 'move' })
-    storyboarderSketchPane.moveContents()
-  })
-  toolbar.on('scale', () => {
-    if (storyboarderSketchPane.isPointerDown) return
-      sfx.playEffect('metal')
-    toolbar.setState({ transformMode: 'scale' })
-    storyboarderSketchPane.scaleContents()
-  })
-  toolbar.on('cancelTransform', () => {
-    // FIXME prevent this case from happening
-    if (storyboarderSketchPane.isPointerDown) {
-      console.warn('pointer is already down')
-      return
-    }
-
-    toolbar.setState({ transformMode: null })
-    storyboarderSketchPane.cancelTransform()
-  })
-  // sketchPane.on('moveMode', enabled => {
-  //   if (enabled) {
-  //     toolbar.setState({ transformMode: 'move' })
-  //   }
-  // })
-  // sketchPane.on('scaleMode', enabled => {
-  //   if (enabled) {
-  //     toolbar.setState({ transformMode: 'scale' })
-  //   }
-  // })
-  // sketchPane.on('cancelTransform', () => {
-  //   toolbar.setState({ transformMode: null })
-  // })
-
-
   toolbar.on('undo', () => {
     if (storyboarderSketchPane.preventIfLocked()) return
 
@@ -882,59 +1108,14 @@ let loadBoardUI = () => {
     }
     sfx.playEffect('metal')
   })
-  
-  toolbar.on('grid', value => {
-    guides.setState({ grid: value })
-    sfx.playEffect('metal')
-  })
-  toolbar.on('center', value => {
-    guides.setState({ center: value })
-    sfx.playEffect('metal')
-  })
-  toolbar.on('thirds', value => {
-    guides.setState({ thirds: value })
-    sfx.playEffect('metal')
-  })
-  toolbar.on('perspective', value => {
-    guides.setState({ perspective: value })
-    sfx.playEffect('metal')
-  })
-  toolbar.on('onion', value => {
-    onionSkin.setEnabled(value)
-    if (onionSkin.getEnabled()) {
-      if (!onionSkin.isLoaded) {
-        onionSkin.load(
-          boardData.boards[currentBoard],
-          boardData.boards[currentBoard - 1],
-          boardData.boards[currentBoard + 1]
-        ).catch(err => console.warn(err))
-      }
-    }
-    sfx.playEffect('metal')
-  })
-  toolbar.on('captions', () => {
-    // HACK!!!
-    let el = document.querySelector('#canvas-caption')
-    el.style.visibility = el.style.visibility == 'hidden'
-      ? 'visible'
-      : 'hidden'
-    sfx.playEffect('metal')
-  })
   toolbar.on('open-in-editor', () => {
     openInEditor()
   })
 
-  storyboarderSketchPane.toolbar = toolbar
+  // initialize
+  store.dispatch({ type: 'TOOLBAR_TOOL_CHANGE', payload: 'light-pencil' })
 
-  if (!toolbar.getState().captions) {
-    let el = document.querySelector('#canvas-caption')
-    el.style.visibility = 'hidden'
-  }
 
-  // HACK force initialize
-  sfx.setMute(true)
-  toolbar.setState({ brush: 'light-pencil' })
-  sfx.setMute(false)
 
   tooltips.init()
 
@@ -964,65 +1145,153 @@ let loadBoardUI = () => {
   //
   colorPicker = new ColorPicker()
   const setCurrentColor = color => {
-    storyboarderSketchPane.setBrushColor(color)
-    toolbar.changeCurrentColor(color)
+    store.dispatch({ type: 'TOOLBAR_TOOL_SET', payload: { color: util.colorToNumber(color) } })
+    colorPicker.setState({ color: color.toCSS() })
+    sfx.playEffect('metal')
+  }
+  const setPaletteColor = (tool, index, color) => {
+    store.dispatch({
+      type: 'TOOLBAR_TOOL_PALETTE_SET',
+      payload: {
+        index,
+        color: util.colorToNumber(color)
+      }
+    })
+
     colorPicker.setState({ color: color.toCSS() })
   }
-  const setPaletteColor = (brush, index, color) => {
-    toolbar.changePaletteColor(brush, index, color)
-    colorPicker.setState({ color: color.toCSS() })
-  }
-  toolbar.on('current-color-picker', color => {
+  toolbar.on('current-color-picker', () => {
     sfx.positive()
     colorPicker.attachTo(document.getElementById('toolbar-current-color'))
     colorPicker.removeAllListeners('color') // HACK
 
     // initialize color picker active swatch
-    colorPicker.setState({ color: color.toCSS() })
+    const state = store.getState()
+    colorPicker.setState({
+      color: Color(
+        util.numberToColor(state.toolbar.tools[state.toolbar.activeTool].color)
+      )
+    })
 
     colorPicker.addListener('color', setCurrentColor)
   })
-  toolbar.on('palette-color-picker', (color, target, brush, index) => {
+  toolbar.on('palette-color-picker', ({ target, index }) => {
     sfx.positive()
 
     colorPicker.attachTo(target)
     colorPicker.removeAllListeners('color') // HACK
 
-    // initialize color picker active swatch
-    colorPicker.setState({ color: color.toCSS() })
+    // initialize color picker to selected palette color
+    const state = store.getState()
+    colorPicker.setState({
+      color: Color(
+        util.numberToColor(state.toolbar.tools[state.toolbar.activeTool].palette[index])
+      )
+    })
 
-    colorPicker.addListener('color', setPaletteColor.bind(this, brush, index))
-  })
-  toolbar.on('current-set-color', color => {
-    storyboarderSketchPane.setBrushColor(color)
-    toolbar.changeCurrentColor(color)
+    colorPicker.addListener('color', setPaletteColor.bind(this, state.toolbar.activeTool, index))
   })
 
-  guides = new Guides(storyboarderSketchPane.getLayerCanvasByName('guides'), { perspectiveGridFn: shotTemplateSystem.requestGrid.bind(shotTemplateSystem) })
-  onionSkin = new OnionSkin(storyboarderSketchPane, boardPath)
-  layersEditor = new LayersEditor(storyboarderSketchPane, sfx, notifications)
-  layersEditor.on('opacity', opacity => {
-    // should we update the value of the project data?
-    let board = boardData.boards[currentBoard]
-    if (opacity.index === LAYER_INDEX_REFERENCE) {
-      if (board.layers && board.layers.reference && !util.isUndefined(board.layers.reference)) {
-        if (board.layers.reference.opacity !== opacity.value) {
-          // update data
-          // layers are in data already, change data directly
-          board.layers.reference.opacity = opacity.value
-          markImageFileDirty([LAYER_INDEX_REFERENCE])
-          markBoardFileDirty()
-        }
+  guides = new Guides({
+    width: storyboarderSketchPane.sketchPane.width,
+    height: storyboarderSketchPane.sketchPane.height,
+    perspectiveGridFn: shotTemplateSystem.requestGrid.bind(shotTemplateSystem),
+    onRender: guideCanvas => {
+      storyboarderSketchPane.sketchPane.layers[
+        storyboarderSketchPane.sketchPane.layers.findByName('guides').index
+      ].replaceTextureFromCanvas(
+        guideCanvas
+      )
+    }
+  })
+  onionSkin = new OnionSkin({
+    width: storyboarderSketchPane.sketchPane.width,
+    height: storyboarderSketchPane.sketchPane.height,
+    onSetEnabled: value => {
+      storyboarderSketchPane.sketchPane.layers[
+        storyboarderSketchPane.sketchPane.layers.findByName('onion').index
+      ].setVisible(value)
+    },
+    onRender: onionSkinCanvas => {
+      storyboarderSketchPane.sketchPane.layers[
+        storyboarderSketchPane.sketchPane.layers.findByName('onion').index
+      ].sprite.blendMode = PIXI.BLEND_MODES.MULTIPLY
+      storyboarderSketchPane.sketchPane.layers[
+        storyboarderSketchPane.sketchPane.layers.findByName('onion').index
+      ].replaceTextureFromCanvas(
+        onionSkinCanvas
+      )
+    }
+  })
+  // connect toolbar state to UI
+  observeStore(store, state => state.toolbar, () => {
+    const state = store.getState()
+
+    // connect to guides
+    guides.setState({
+      grid: state.toolbar.grid,
+      center: state.toolbar.center,
+      thirds: state.toolbar.thirds,
+      perspective: state.toolbar.perspective
+    })
+
+    // connect to captions
+    document.querySelector('#canvas-caption').style.visibility = state.toolbar.captions
+      ? 'visible'
+      : 'hidden'
+
+    // connect to onion skin
+    if (onionSkin.state.enabled !== state.toolbar.onion) {
+      if (state.toolbar.onion) {
+        onionSkin.setState({ enabled: true })
+        onionSkin.load().catch(err => {
+          console.log('could not load onion skin')
+          console.log(err)
+        })
       } else {
-        // create data
-        // need to create layers
-        markImageFileDirty([LAYER_INDEX_REFERENCE])
+        onionSkin.setState({ enabled: false })
+      }
+    }
+  }, true)
+
+  layersEditor = new LayersEditor(storyboarderSketchPane, sfx, notifications)
+  layersEditor.on('opacity', async params => {
+    let board = boardData.boards[currentBoard]
+
+    // always update the sketchpane
+    let layer = storyboarderSketchPane.sketchPane.layers.findByName('reference')
+    storyboarderSketchPane.setLayerOpacity(layer.index, params.value)
+
+    // if board has a reference layer ...
+    if (board.layers && board.layers.reference) {
+      // ... and the opacity value is stale ...
+      if (board.layers.reference.opacity !== params.value) {
+        // ... update the opacity value ...
+        board.layers.reference.opacity = params.value
+        // ... and save the board file
+        markBoardFileDirty()
+
+        // update posterframe and thumbnail
+        markImageFileDirty([layer.index])
+
+        // alternately, to immediately update ONLY posterframe and thumbnail:
+        /*
+        // update the posterframe
+        await savePosterFrame(board, false)
+        // update the thumbnail
+        let index = await saveThumbnailFile(boardData.boards.indexOf(board))
+        await updateThumbnailDisplayFromFile(index)
+        */
       }
     }
   })
   storyboarderSketchPane.on('requestPointerDown', () => {
     // if artist is drawing on the reference layer, ensure it has opacity
-    if (toolbar.state.brush === 'light-pencil' && storyboarderSketchPane.sketchPane.getLayerOpacity() === 0) {
+    if (
+      store.getState().toolbar.activeTool === 'light-pencil' && 
+      storyboarderSketchPane.getLayerOpacity(
+        storyboarderSketchPane.sketchPane.layers.findByName('reference').index) === 0
+      ) {
       layersEditor.setReferenceOpacity(exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY)
     }
   })
@@ -1048,7 +1317,6 @@ let loadBoardUI = () => {
       if (choice === 0) {
         // Open in Photoshop
         openInEditor()
-
       } else if (choice === 1) {
         // Draw in Storyboarder
         const confirmChoice = remote.dialog.showMessageBox({
@@ -1062,7 +1330,7 @@ let loadBoardUI = () => {
           ],
           defaultId: 1
         })
-        
+
         if (confirmChoice === 0) {
           // Unlink and Draw
           notifications.notify({ message: `Stopped watching\n${board.link}\nfor changes.` })
@@ -1072,9 +1340,6 @@ let loadBoardUI = () => {
 
           storyboarderSketchPane.setIsLocked(false)
         }
-      } else {
-        // Cancel
-        return
       }
     }
   })
@@ -1108,23 +1373,22 @@ let loadBoardUI = () => {
   sfx.init()
 
   const enableDrawingSoundEffects = prefsModule.getPrefs('sound effects')['enableDrawingSoundEffects']
-  if(enableDrawingSoundEffects) {
+  if (enableDrawingSoundEffects) {
     storyboarderSketchPane.on('pointerdown', Sonifier.start)
     storyboarderSketchPane.on('pointermove', Sonifier.trigger)
-    storyboarderSketchPane.sketchPane.on('onup', Sonifier.stop)
-    Sonifier.init(storyboarderSketchPane.sketchPane.getCanvasSize())
-    window.addEventListener('resize', () => {
-      Sonifier.setSize(storyboarderSketchPane.sketchPane.getCanvasSize())
-    })
+    storyboarderSketchPane.on('pointerup', Sonifier.stop)
+
+    Sonifier.init(storyboarderSketchPane.getCanvasSize())
+
+    window.addEventListener('resize', () =>
+      Sonifier.setSize(storyboarderSketchPane.getCanvasSize()))
   }
 
-  let onUndoStackAction = (state) => {
-    if (state.type == 'image') {
-      applyUndoStateForImage(state)
-    } else if (state.type == 'scene') {
-      saveImageFile().then(() => { // needed for redo
-        applyUndoStateForScene(state)
-      })
+  const onUndoStackAction = async (state) => {
+    if (state.type === 'image') {
+      await applyUndoStateForImage(state)
+    } else if (state.type === 'scene') {
+      await applyUndoStateForScene(state)
     }
   }
   undoStack.on('undo', onUndoStackAction)
@@ -1143,10 +1407,21 @@ let loadBoardUI = () => {
         // make sure we capture the last frame
         notifications.notify({message: "Congratulations! Generating your timelapse! This can take a minute.", timing: 5})
 
+        // grab full-size image from current sketchpane (in memory)
+        let pixels = storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+          storyboarderSketchPane.sketchPane.width,
+          storyboarderSketchPane.sketchPane.height,
+          storyboarderSketchPane.visibleLayersIndices
+        )
+        // un-premultiply
+        SketchPaneUtil.arrayPostDivide(pixels)
+        // send as a canvas
         canvasRecorder.capture([
-          storyboarderSketchPane.sketchPane.getLayerCanvas(0),
-          storyboarderSketchPane.sketchPane.getLayerCanvas(1),
-          storyboarderSketchPane.sketchPane.getLayerCanvas(3)
+          SketchPaneUtil.pixelsToCanvas(
+            pixels,
+            storyboarderSketchPane.sketchPane.width,
+            storyboarderSketchPane.sketchPane.height
+          )
         ], {force: true})
         setTimeout(()=>{
           canvasRecorder.stop()
@@ -1164,7 +1439,7 @@ let loadBoardUI = () => {
 
     pomodoroTimerView.addListener('start', (data)=>{
       toolbar.startPomodoroTimer(data)
-      let boardSize = storyboarderSketchPane.sketchPane.getCanvasSize()
+      let boardSize = storyboarderSketchPane.getCanvasSize()
       let outputWidth = 700
       let targetOutputHeight = (outputWidth/boardSize.width)*boardSize.height
 
@@ -1192,25 +1467,33 @@ let loadBoardUI = () => {
     pomodoroTimerView.attachTo(document.getElementById('toolbar-pomodoro-running'))
   })
 
+
+
+  //
+  //
   // Devtools
+  //
+  // devtools-focused
   ipcRenderer.on('devtools-focused', () => {
-    // devtools-focused
     textInputMode = true
+
+    // listen for focus to change
+    window.addEventListener('focus', onDevToolsBlur)
   })
+  // devtools-closed
   ipcRenderer.on('devtools-closed', () => {
-    // devtools-closed
-    textInputMode = false
+    onDevToolsBlur()
   })
-  window.addEventListener('focus', () => {
-    // devtools-blur
+  // devtools-blur
+  const onDevToolsBlur = () => {
+    window.removeEventListener('focus', onDevToolsBlur)
+
     textInputMode = false
-  })
+  }
 
   window.addEventListener('beforeunload', event => {
     console.log('Close requested! Saving ...')
 
-    // TODO THIS IS SLOW AS HELL. NEED TO FIX PREFS
-    toolbar.savePrefs()
     saveImageFile() // NOTE image is saved first, which ensures layers are present in data
     saveBoardFile() // ... then project data can be saved
 
@@ -1225,6 +1508,26 @@ let loadBoardUI = () => {
 
       // remove any existing listeners
       watcher && watcher.close()
+
+      // dispatch a change to preferences merging in toolbar data
+      // first dispatch locally
+      store.dispatch({ type: 'PREFERENCES_MERGE_FROM_TOOLBAR', payload: store.getState().toolbar, meta: { scope: 'local' } })
+      console.log('setting toolbar preferences')
+      // TODO set caption value from toolbar ui state
+      prefsModule.set('toolbar', store.getState().preferences.toolbar)
+      console.log('writing to prefs.json')
+      prefsModule.savePrefs()
+      // then, let main and the rest of the renderers know
+      // NOTE this is async
+      // TODO use wait-service instead? https://jlongster.com/Two-Weird-Tricks-with-Redux
+      //      would be nice to dispatch to main + renderers, wait until we know they all have state, then save
+      store.dispatch({ type: 'PREFERENCES_MERGE_FROM_TOOLBAR', payload: store.getState().toolbar })
+
+      // TODO should we have an explicit SCENE_FILE_CLOSED dispatch?
+      store.dispatch({
+        type: 'SCENE_FILE_LOADED',
+        payload: { path: null }
+      })
     }
   })
 
@@ -1232,11 +1535,32 @@ let loadBoardUI = () => {
   window.addEventListener('blur', () => {
     textInputMode = true
   })
-  ipcRenderer.on('prefs:change', (event, newPrefs) => {
-    if (boardData && boardData.defaultBoardTiming != newPrefs.defaultBoardTiming) {
-      boardData.defaultBoardTiming = newPrefs.defaultBoardTiming
-      saveBoardFile()
-      renderMetaData()
+  window.addEventListener('focus', () => {
+    // is a child window still claiming focus?
+    for (let w of remote.getCurrentWindow().getChildWindows()) {
+      if (w.isFocused()) {
+        // keep preventing text input
+        textInputMode = true
+        return
+      }
+    }
+
+    // otherwise, allow direct text input again
+    textInputMode = false
+  })
+  // changedPrefs is an object with only the top-level primitive prefs that have actually changed (it does not track objects or arrays nested in prefs)
+  ipcRenderer.on('prefs:change', (event, changedPrefs) => {
+    if (Object.keys(changedPrefs).length) {
+      if (boardData && changedPrefs.defaultBoardTiming != null && boardData.defaultBoardTiming != changedPrefs.defaultBoardTiming) {
+        boardData.defaultBoardTiming = changedPrefs.defaultBoardTiming
+        saveBoardFile()
+        renderMetaData()
+      }
+
+      notifications.notify({
+        message: `Storyboarder preferences have changed. Please close and re-open this project window for new preferences to take effect.`,
+        timing: 30
+      })
     }
   })
 
@@ -1256,22 +1580,22 @@ let loadBoardUI = () => {
         camera
       }
       markBoardFileDirty()
-      guides.setPerspectiveParams({
+      guides && guides.setPerspectiveParams({
         cameraParams: board.sts && board.sts.camera,
         rotation: 0
       })
 
       if (!img) return
 
-      storyboarderSketchPane.replaceLayer(LAYER_INDEX_REFERENCE, img)
+      storyboarderSketchPane.replaceLayer(storyboarderSketchPane.sketchPane.layers.findByName('reference').index, img)
 
       // force a file save and thumbnail update
-      markImageFileDirty([LAYER_INDEX_REFERENCE])
+      markImageFileDirty([storyboarderSketchPane.sketchPane.layers.findByName('reference').index])
       saveImageFile()
     })
   } else {
     notifications.notify({ message: 'For better performance on your machine, Shot Generator and Perspective Guide have been disabled.' })
-    document.querySelector('#shot-generator-container').remove()
+    StsSidebar.setEnabled(false)
   }
 
   sceneSettingsView.init({ fps: boardData.fps })
@@ -1536,7 +1860,7 @@ let loadBoardUI = () => {
   // remote.getCurrentWebContents().openDevTools()
 }
 
-let updateBoardUI = async () => {
+const updateBoardUI = async () => {
   log({ type: 'progress', message: 'Rendering User Interface' })
 
   document.querySelector('#canvas-caption').style.display = 'none'
@@ -1644,6 +1968,12 @@ let insertNewBoardDataAtPosition = (position) => {
 }
 
 let newBoard = async (position, shouldAddToUndoStack = true) => {
+  // NOTE when loading a script, storyboarderSketchPane will not be initialized yet #1235
+  if (storyboarderSketchPane && storyboarderSketchPane.getIsDrawingOrStabilizing()) {
+    sfx.error()
+    return Promise.reject('not ready')
+  }
+
   if (isSavingImageFile) {
     // notifications.notify({ message: 'Could not create new board. Please wait until Storyboarder has saved all recent image edits.', timing: 5 })
     sfx.error()
@@ -1658,17 +1988,18 @@ let newBoard = async (position, shouldAddToUndoStack = true) => {
   }
 
   // create array entry
-  insertNewBoardDataAtPosition(position)
+  let board = insertNewBoardDataAtPosition(position)
 
-  // NOTE because we immediately call `gotoBoard` after this,
-  //      the following causes the _newly created_ duplicate to be marked dirty
-  //      (not the current board)
-  // indicate dirty for save sweep
-  markImageFileDirty([1]) // 'main' layer is dirty // HACK hardcoded
   markBoardFileDirty() // board data is dirty
 
-  // display blank thumbnail (file will not exist yet)
-  await setThumbnailDisplayAsPending(position)
+  // NOTE when loading a script, sketchPane is not initialized yet #1235
+  //      posterframe will be created by loadSketchPaneLayers instead
+  if (typeof sketchPane != 'undefined') {
+    // create blank posterframe
+    await savePosterFrame(board, true)
+  }
+  // create blank thumbnail
+  await saveThumbnailFile(position, { forceReadFromFiles: true })
 
   renderThumbnailDrawer()
   storeUndoStateForScene()
@@ -1689,118 +2020,103 @@ let newBoard = async (position, shouldAddToUndoStack = true) => {
 // - PNG
 // - PSD, must have a layer named 'reference' (unless importTargetLayer preference is set to load a different one)
 //
+// TODO support EXIF orientation see: https://github.com/wonderunit/storyboarder/issues/1123
 let insertNewBoardsWithFiles = async filepaths => {
-  // TODO saveImageFile() first?
+  console.log('main-window#insertNewBoardsWithFiles')
 
-  let count = filepaths.length
+  // TODO when would importTargetLayer not be 'reference'?
+  // TODO insertNewBoardsWithFiles only supports reference and main anyway
+  const targetLayer = prefsModule.getPrefs('main')['importTargetLayer'] || 'reference'
+
+  const count = filepaths.length
   notifications.notify({
-    message: `Importing ${count} image${count !== 1 ? 's':''}.\nPlease wait...`,
+    message: `Importing ${count} image${count !== 1 ? 's' : ''}.\nPlease wait …`,
     timing: 2
   })
 
   let insertionIndex = currentBoard + 1
 
-  // TODO when do we ever have importTargetLayer set to anything but 'reference?'
-  let targetLayer = prefsModule.getPrefs('main')['importTargetLayer'] || 'reference'
-  let readerOptions = {
-    importTargetLayer: targetLayer
-  }
-
   let numAdded = 0
 
   for (let filepath of filepaths) {
-    let imageData = FileHelper.getBase64ImageDataFromFilePath(filepath, readerOptions)
+    let imageData = FileHelper.getBase64ImageDataFromFilePath(
+      filepath,
+      {
+        importTargetLayer: targetLayer
+      }
+    )
+
     if (!imageData || !imageData[targetLayer]) {
-      notifications.notify({ message: `Oops! There was a problem importing ${filepath}`, timing: 10 })
+      console.error('Could not find imageData', { imageData, targetLayer })
+      notifications.notify({
+        message: `Oops! There was a problem importing ${filepath}. Try adding a layer named 'reference' for Storyboarder to import.`,
+        timing: 10
+      })
       return
     }
 
     try {
-      await new Promise((resolve, reject) => {
-        let image = new Image()
+      // resize image if too big
+      const datauri = await fitImageData(
+        [
+          storyboarderSketchPane.sketchPane.width,
+          storyboarderSketchPane.sketchPane.height
+        ],
+        imageData[targetLayer]
+      )
 
-        //
-        // TODO DRY this up
-        // TODO we have functions elsewhere that do a lot of this
-        //
-        image.onload = () => {
-          let board = insertNewBoardDataAtPosition(insertionIndex++)
+      storeUndoStateForScene(true)
+      let board = insertNewBoardDataAtPosition(insertionIndex)
+      storeUndoStateForScene()
 
-          // resize the image if it's too big.
-          let boardSize = storyboarderSketchPane.sketchPane.getCanvasSize()
-          if(boardSize.width < image.width) {
-            let scale = boardSize.width / image.width
-            image.width = scale * image.width
-            image.height = scale * image.height
-          }
-          if(boardSize.height < image.height) {
-            let scale = boardSize.height / image.height
-            image.width = scale * image.width
-            image.height = scale * image.height
-          }
+      let layerName
+      if (
+        targetLayer === 'main' || // for old preferences files
+        targetLayer === 'fill'
+      ) {
+        console.log('adding as fill')
+        layerName = 'fill'
+      } else {
+        console.log('adding as reference')
+        layerName = 'reference'
+      }
 
-          // TODO: try pooling
-          var canvas = document.createElement('canvas')
-          canvas.width = image.width
-          canvas.height = image.height
-          let context = canvas.getContext('2d')
-          context.drawImage(image, 0, 0, image.width, image.height)
-          var imageDataSized = canvas.toDataURL()
-          let savePath = board.url.replace('.png', '-reference.png')
-          if(targetLayer === "main") {
-            savePath = board.url
-          } else {
-            board.layers[targetLayer] = { "url": savePath }
-            // save out an empty main layer
-            saveDataURLtoFile((document.createElement('canvas')).toDataURL(), board.url)
-          }
-          saveDataURLtoFile(imageDataSized, savePath)
+      // update the board data
+      board.layers[layerName] = {
+        url: boardModel.boardFilenameForLayer(board, layerName),
+        ...(
+          layerName === 'reference'
+            ? { opacity: 1.0 } // alternatively: exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY
+            : {}
+        )
+      }
+      console.log('saving inserted board as', board.layers[layerName].url)
+      saveDataURLtoFile(datauri, board.layers[layerName].url)
 
-          // thumbnail
-          const thumbnailHeight = 60
-          let thumbRatio = thumbnailHeight / boardSize.height
-          
-          image.width = (image.width / boardSize.width) * (thumbRatio * boardSize.width)
-          image.height = image.height / boardSize.height * 60
-          canvas.width = thumbRatio * boardSize.width
-          canvas.height = thumbnailHeight
-          context.drawImage(image, 0, 0, image.width, image.height)
-          var imageDataSized = canvas.toDataURL()
-          let thumbPath = board.url.replace('.png', '-thumbnail.png')
-          saveDataURLtoFile(imageDataSized, thumbPath)
-          numAdded++
-          resolve()
-        }
+      await savePosterFrame(board, true)
+      await saveThumbnailFile(insertionIndex, { forceReadFromFiles: true })
 
-        image.onerror = event => {
-          reject(new Error(`Image file is missing or invalid`))
-        }
+      markBoardFileDirty() // save new board data
 
-        image.src = imageData[targetLayer]
-      })
+      insertionIndex++
+      numAdded++
     } catch (error) {
       console.error('Got error', error)
-      notifications.notify({ message: `Could not load image ${path.basename(filepath)}\n` + error.message, timing: 10 })
+      notifications.notify({
+        message: `Could not load image ${path.basename(filepath)}\n` + error.message,
+        timing: 10
+      })
     }
   }
 
-  // TODO do we need to mark the current layer dirty??
-  //
-  // if (targetLayer === 'reference') {
-  //   markImageFileDirty([LAYER_INDEX_REFERENCE])
-  // } else {
-  //   markImageFileDirty([LAYER_INDEX_MAIN])
-  // }
-
-  markBoardFileDirty() // to save new board data
   renderThumbnailDrawer()
 
   notifications.notify({
-    message:  `Imported ${numAdded} image${numAdded !== 1 ? 's':''}.\n\n` +
-              `The image${numAdded !== 1 ? 's are':' is'} on the reference layer, `+
-              `so you can draw over ${numAdded !== 1 ? 'them':'it'}. ` +
-              `If you'd like ${numAdded !== 1 ? 'them':'it'} to be the main layer, ` +
-              `you can merge ${numAdded !== 1 ? 'them':'it'} up on the sidebar`,
+    message: `Imported ${numAdded} image${numAdded !== 1 ? 's' : ''}.\n\n` +
+             `The image${numAdded !== 1 ? 's are' : ' is'} on the reference layer, ` +
+             `so you can draw over ${numAdded !== 1 ? 'them' : 'it'}. ` +
+             `If you'd like ${numAdded !== 1 ? 'them' : 'it'} to be the main layer, ` +
+             `you can merge ${numAdded !== 1 ? 'them' : 'it'} up on the sidebar`,
     timing: 10
   })
   sfx.positive()
@@ -1851,9 +2167,8 @@ let saveBoardFile = (opt = { force: false }) => {
 }
 
 let markImageFileDirty = layerIndices => {
-  for (let index of layerIndices) {
-    layerStatus[index].dirty = true
-  }
+  // force update layers dirty flag
+  storyboarderSketchPane.markLayersDirty(layerIndices)
 
   clearTimeout(imageFileDirtyTimer)
   imageFileDirtyTimer = setTimeout(saveImageFile, 5000)
@@ -1888,6 +2203,16 @@ const onDrawIdle = () => {
 
   // update the thumbnail
   updateThumbnailDisplayFromMemory()
+
+  // notification
+  if (!hasWarnedOnceAboutFps && storyboarderSketchPane.shouldWarnAboutFps()) {
+    hasWarnedOnceAboutFps = true
+    notifications.notify({
+      message:  'Hmm, looks like Storyboarder is running a little slow. ' +
+                'For a speed boost, try disabling the “High Quality Drawing Engine” in Preferences.',
+      timing: 30
+    })
+  }
 }
 
 let saveDataURLtoFile = (dataURL, filename) => {
@@ -1899,14 +2224,18 @@ let saveDataURLtoFile = (dataURL, filename) => {
 //
 // saveImageFile
 //
-//  - saves DIRTY layers (including main)
+//  - saves DIRTY layers
 //  - saves CURRENT board
 //
 // this function saves only the CURRENT board
 // call it before changing boards to ensure the current work is saved
 //
 let saveImageFile = async () => {
+  console.log('main-window#saveImageFile')
+
   isSavingImageFile = true
+
+  let indexToSave = currentBoard
 
   // are we still drawing?
   if (storyboarderSketchPane.getIsDrawingOrStabilizing()) {
@@ -1917,9 +2246,92 @@ let saveImageFile = async () => {
     return
   }
 
+  const imagesPath = path.join(boardPath, 'images')
 
-  let board = boardData.boards[currentBoard]
+  let board = boardData.boards[indexToSave]
 
+  let exportables = []
+  let total = 0
+  let complete = 0
+  for (let index of storyboarderSketchPane.visibleLayersIndices) {
+    if (storyboarderSketchPane.getLayerDirty(index)) {
+      let layer = storyboarderSketchPane.sketchPane.layers[index]
+
+      let filename = boardModel.boardFilenameForLayer(board, layer.name)
+
+      // ensure board.layers exists
+      if (!board.layers) {
+        board.layers = {}
+        markBoardFileDirty()
+      }
+
+      // ensure board.layers[layer.name] exists
+      if (!board.layers[layer.name]) {
+        console.log(`\tadding layer “${layer.name}” to board data`)
+        board.layers[layer.name] = {
+          url: filename,
+
+          // special case for reference layer
+          // initialize the opacity from the LayersEditor's current value
+          // TODO keep the temp ref opacity val somewhere useful (see: #1116)
+          opacity: (index === storyboarderSketchPane.sketchPane.layers.findByName('reference').index)
+            ? layersEditor.getReferenceOpacity()
+            : undefined
+        }
+        markBoardFileDirty()
+      }
+
+      let imageFilePath = path.join(imagesPath, filename)
+      exportables.push({ index, layer, imageFilePath })
+
+      total++
+    }
+  }
+
+  // note in the board file all the layers we intend to save now
+  saveBoardFile()
+
+  // TODO if posterframe does not exist should we create? like we do with thumbnails?
+  // save the poster frame first
+  // if at least one layer is dirty, save a poster frame JPG
+  if (total > 0) {
+    await savePosterFrame(board, indexToSave !== currentBoard)
+  }
+
+  // export layers to PNG
+  for (let { index, layer, imageFilePath } of exportables) {
+    console.log(`\tsaving layer “${layer.name}” to ${imageFilePath}`)
+    fs.writeFileSync(
+      imageFilePath,
+      storyboarderSketchPane.exportLayer(index, 'base64'),
+      'base64'
+    )
+
+    storyboarderSketchPane.clearLayerDirty(index)
+
+    complete++
+  }
+
+  // TODO should we only clear the timeout if we saved at least one file?
+  clearTimeout(imageFileDirtyTimer)
+
+  if (complete > 0) {
+    console.log(`\tsaved ${complete} modified layers`)
+  }
+
+  // create/update the thumbnail image file if necessary
+  if (complete > 0) {
+    // TODO can this be synchronous?
+    await saveThumbnailFile(indexToSave)
+    await updateThumbnailDisplayFromFile(indexToSave)
+    // TODO save a posterframe?
+  }
+
+  isSavingImageFile = false
+
+  return indexToSave
+
+  /*
   let layersData = [
     [1, 'main', board.url],
     [0, 'reference', board.url.replace('.png', '-reference.png')],
@@ -1931,29 +2343,25 @@ let saveImageFile = async () => {
 
   let numSaved = 0
   for (let [index, layerName, filename] of layersData) {
-    if (layerStatus[index].dirty) {
+    if (storyboarderSketchPane.getLayerDirty(index)) {
       shouldSaveThumbnail = true
       clearTimeout(imageFileDirtyTimer)
 
-      let canvas = storyboarderSketchPane.sketchPane.getLayerCanvas(index)
       let imageFilePath = path.join(boardPath, 'images', filename)
-
-      let imageData = canvas
-        .toDataURL('image/png')
-        .replace(/^data:image\/\w+;base64,/, '')
+      let imageData = storyboarderSketchPane.exportLayer(index, 'base64')
 
       try {
         fs.writeFileSync(imageFilePath, imageData, 'base64')
 
         // add to boardData if it doesn't already exist
-        if (index !== LAYER_INDEX_MAIN) {
+        if (index !== storyboarderSketchPane.sketchPane.layers.findByName('main').index) {
           board.layers = board.layers || {}
 
           if (!board.layers[layerName]) {
             board.layers[layerName] = { url: filename }
 
             // special handling for reference layer
-            if (index === LAYER_INDEX_REFERENCE) {
+            if (index === storyboarderSketchPane.sketchPane.layers.findByName('reference').index) {
               let referenceOpacity = layersEditor.getReferenceOpacity()
               if (board.layers.reference.opacity !== referenceOpacity) {
                 // update the value
@@ -1967,7 +2375,7 @@ let saveImageFile = async () => {
           }
         }
 
-        layerStatus[index].dirty = false
+        storyboarderSketchPane.clearLayerDirty(index)
         numSaved++
         console.log('\tsaved', layerName, 'to', filename)
       } catch (err) {
@@ -1993,46 +2401,119 @@ let saveImageFile = async () => {
   isSavingImageFile = false
 
   return indexToSave
+  */
+}
+
+// TODO performance
+const savePosterFrame = async (board, forceReadFromFiles = false) => {
+  const imageFilePath = path.join(
+    boardPath,
+    'images',
+    boardModel.boardFilenameForPosterFrame(board)
+  )
+
+  let canvas
+
+  // composite from files
+  if (forceReadFromFiles) {
+    canvas = document.createElement('canvas')
+    canvas.width = storyboarderSketchPane.sketchPane.width
+    canvas.height = storyboarderSketchPane.sketchPane.height
+    await exporterCommon.flattenBoardToCanvas(
+      board,
+      canvas,
+      [
+        canvas.width,
+        canvas.height
+      ],
+      boardFilename
+    )
+
+  // composite from memory
+  } else {
+    // grab full-size image from current sketchpane (in memory)
+    let pixels = storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+      storyboarderSketchPane.sketchPane.width,
+      storyboarderSketchPane.sketchPane.height,
+      storyboarderSketchPane.visibleLayersIndices
+    )
+
+    SketchPaneUtil.arrayPostDivide(pixels)
+
+    canvas = SketchPaneUtil.pixelsToCanvas(
+      pixels,
+      storyboarderSketchPane.sketchPane.width,
+      storyboarderSketchPane.sketchPane.height
+    )
+  }
+
+  // draw a white matte background behind the transparent art
+  let context = canvas.getContext('2d')
+  context.globalCompositeOperation = 'destination-over'
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  // save to a file
+  fs.writeFileSync(
+    imageFilePath,
+    canvas.toDataURL('image/jpeg').replace(/^data:image\/\w+;base64,/, ''),
+    'base64'
+  )
+
+  console.log('saved posterframe', path.basename(imageFilePath))
 }
 
 let openInEditor = async () => {
   console.log('openInEditor')
 
-  let selectedBoards = []
-  let imageFilePaths = []
-
   try {
+    let selectedBoards = []
+
     // assume selection always includes currentBoard, 
     // so make sure we've saved its contents to the filesystem
     await saveImageFile()
     // and indicate that it is now locked
     storyboarderSketchPane.setIsLocked(true)
 
-
     for (let selection of selections) {
-      console.log('\tselection:', selection)
       selectedBoards.push(boardData.boards[selection])
     }
 
     // save each selected board to its own PSD
     for (board of selectedBoards) {
-      // collect the layer data
-      let pngPaths = []
-      if (board.layers.reference && board.layers.reference.url) {
-        pngPaths.push({
-          url: path.join(boardPath, 'images', board.layers.reference.url),
-          name: "reference"
-        })
-      }
-      pngPaths.push({
-          url: path.join(boardPath, 'images', board.url),
-          name: "main"
-      })
-      if (board.layers.notes && board.layers.notes.url) {
-        pngPaths.push({
-          url: path.join(boardPath, 'images', board.layers.notes.url),
-          name: "notes"
-        })
+      // collect the layer image data
+      let namedCanvases = []
+      for (let index of storyboarderSketchPane.visibleLayersIndices) {
+        let layer = storyboarderSketchPane.sketchPane.layers[index]
+        if (board.layers[layer.name]) {
+          // load the image to a canvas
+          let image = await exporterCommon.getImage(path.join(boardPath, 'images', board.layers[layer.name].url))
+
+          let canvas = document.createElement('canvas')
+          let context = canvas.getContext('2d')
+
+          canvas.width = image.naturalWidth
+          canvas.height = image.naturalHeight
+
+          context.drawImage(image, 0, 0)
+
+          namedCanvases.push({
+            canvas,
+            name: layer.name
+          })
+        } else {
+          // blank transparent layer
+          let canvas = document.createElement('canvas')
+          let context = canvas.getContext('2d')
+
+          canvas.width = storyboarderSketchPane.sketchPane.width
+          canvas.height = storyboarderSketchPane.sketchPane.height
+
+          namedCanvases.push({
+            canvas,
+            name: layer.name
+          })
+        }
       }
 
       // assign a PSD file path
@@ -2089,7 +2570,8 @@ let openInEditor = async () => {
       }
 
       if (shouldOverwrite) {
-        await FileHelper.writePhotoshopFileFromPNGPathLayers(pngPaths, psdPath)
+        let buffer = await exporterPsd.toPsdBuffer(namedCanvases, psdPath)
+        fs.writeFileSync(psdPath, buffer)
       }
 
       // update the 'link'
@@ -2157,9 +2639,20 @@ let openInEditor = async () => {
     for (let board of selectedBoards) {
       console.log('\twatcher add', path.join(boardPath, 'images', board.link))
       watcher.add(path.join(boardPath, 'images', board.link))
-      console.log('\twatching', JSON.stringify(watcher.getWatched(), null, 2))
     }
     ipcRenderer.send('analyticsEvent', 'Board', 'edit in photoshop')
+
+    // HACK because this is async, with no callback, we just check back in 100 msecs :/
+    // see: https://github.com/paulmillr/chokidar/issues/542#issuecomment-255496275
+    //
+    // a more reliable approach would be to create a new watcher instance each time,
+    // which would always fire a 'ready' event
+    // https://github.com/paulmillr/chokidar/issues/487#issuecomment-222714731
+    //
+    setTimeout(
+      () => console.log('\twatching', JSON.stringify(watcher.getWatched(), null, 2)),
+      100
+    )
 
   } catch (error) {
     notifications.notify({ message: '[WARNING] Error opening files in editor.' })
@@ -2181,6 +2674,8 @@ const onLinkedFileChange = async (eventType, filepath, stats) => {
 }
 
 const refreshLinkedBoardByFilename = async filename => {
+  console.log('refreshLinkedBoardByFilename', filename)
+
   // find the board by link filename
   let board
   for (let b of boardData.boards) {
@@ -2190,48 +2685,152 @@ const refreshLinkedBoardByFilename = async filename => {
     }
   }
   if (!board) {
-    console.log('Tried to update, from editor, a file that does not exist in the scene:', filename)
+    console.log('Tried to update, from external editor, a file that does not exist in the scene:', filename)
     return
   }
 
-  let psdData
-  let readerOptions = {}
   let curBoard = boardData.boards[currentBoard]
+
   // Update the current canvas if it's the same board coming back in.
-  let isCurrentBoard = false
-  
-  if (curBoard.uid === board.uid) {
-    readerOptions.referenceCanvas = storyboarderSketchPane.getLayerCanvasByName("reference")
-    readerOptions.mainCanvas = storyboarderSketchPane.getLayerCanvasByName("main")
-    readerOptions.notesCanvas = storyboarderSketchPane.getLayerCanvasByName("notes")
-    storeUndoStateForImage(true, [0, 1, 3])
-    isCurrentBoard = true
-  }
-  
-  psdData = FileHelper.getBase64ImageDataFromFilePath(path.join(boardPath, 'images', board.link), readerOptions)
-  if (!psdData || !psdData.main) {
-    notifications.notify({ message: `[WARNING] Could not import from file ${filename}. You may be using an unsupported PSD feature.` })
-    return
-  }
+  let isCurrentBoard = curBoard.uid === board.uid
 
   if (isCurrentBoard) {
-    storeUndoStateForImage(false, [0, 1, 3])
-    markImageFileDirty([0, 1, 3]) // reference, main, notes layers
-    // save image and update thumbnail
-    await saveImageFile()
-    renderThumbnailDrawer()
-  } else {
-    saveDataURLtoFile(psdData.main, board.url)
-    psdData.notes && saveDataURLtoFile(psdData.notes, board.url.replace('.png', '-notes.png'))
-    psdData.reference && saveDataURLtoFile(psdData.reference, board.url.replace('.png', '-reference.png'))
-  
-    // explicitly indicate to renderer that the file has changed
-    setEtag(path.join(boardPath, 'images', boardModel.boardFilenameForThumbnail(board)))
+    // save undo state for ALL layers
+    storeUndoStateForImage(true, storyboarderSketchPane.visibleLayersIndices)
+  }
 
+  console.log('\treading', path.join(boardPath, 'images', board.link))
+
+  let canvases
+  try {
+    canvases = importerPsd.fromPsdBuffer(
+      fs.readFileSync(
+        path.join(boardPath, 'images', board.link)
+      )
+    )
+  } catch (err) {
+    console.error(err)
+  }
+
+  if (!canvases || !Object.keys(canvases).length) {
+    notifications.notify({
+      message: `[WARNING] Could not import from file ${filename}. ` +
+               'That PSD might be using a feature (like text layers or masks) ' +
+               'that Storyboarder does not support. ' +
+               'Or, it might be missing required named layers.'
+    })
+    return
+  }
+
+  console.log('\t*** updating from PSD ***', isCurrentBoard)
+  console.log('\tisCurrentBoard?', isCurrentBoard)
+  if (isCurrentBoard) {
+    // write to SketchPane layers and mark dirty
+
+    let dirty = []
+
+    // for every possible layer ...
+    for (let index of storyboarderSketchPane.visibleLayersIndices) {
+      let layer = storyboarderSketchPane.sketchPane.layers[index]
+      let layerName = layer.name
+      let canvas = canvases[layerName]
+      if (canvas) {
+        // layer is in the PSD, so use it
+        console.log('\treplacing contents of', layerName)
+        // TODO could avoid replacing/dirtying the layer if canvas is blank?
+        layer.replace(canvas)
+        dirty.push(layer.index)
+      } else {
+        // layer was NOT in the PSD, so clear it
+        console.log('\tclearing unused', layerName)
+        // TODO if already empty, could avoid clear?
+        layer.clear()
+        // NOTE we DO NOT save to PNG, since we're about to remove the layer data
+
+        // have we been tracking this layer? ...
+        if (board.layers[layerName]) {
+          // ... then delete the layer from data entirely
+          console.log('\tdeleting layer data for', layerName)
+          delete board.layers[layerName]
+          // NOTE we DO NOT delete the PNG file from the file system
+        }
+      }
+    }
+
+    // store undo state for every single layer
+    storeUndoStateForImage(false, storyboarderSketchPane.visibleLayersIndices)
+    // mark the layers that actually changed
+    markImageFileDirty(dirty)
+
+    // uncomment to save ALL layer images immediately
+    // save image and update thumbnail
+    // await saveImageFile()
+
+    // just update thumbnail immediately
     let index = await saveThumbnailFile(boardData.boards.indexOf(board))
     await updateThumbnailDisplayFromFile(index)
+
+    renderThumbnailDrawer()
+  } else {
+    // clear contents of layer PNGs that aren't in the PSD
+    // TODO this will break when we add user-managed layers
+  
+    // NOTE HACK assumes current boards visibleLayersIndices matches
+    // the other board's layers organization!
+
+    // for every possible layer ...
+    for (let index of storyboarderSketchPane.visibleLayersIndices) {
+      // ... get the name of the layer
+      let layer = storyboarderSketchPane.sketchPane.layers[index]
+      let layerName = layer.name
+
+      let canvas = canvases[layerName]
+      let filename = boardModel.boardFilenameForLayer(board, layerName)
+
+      // did the PSD contain a canvas by this layer's name?
+      if (canvas) {
+        // add the layer to the board data (if it does not already exist)
+        if (!board.layers[layerName]) {
+          console.log('\tadding layer data for', layerName)
+          board.layers[layerName] = {
+            url: filename,
+            opacity: layerName === 'reference'
+              ? 1.0
+              : undefined // alternatively: exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY
+          }
+          markBoardFileDirty()
+        }
+
+        // save the PSD canvas over the existing file
+        console.log('\tsaving layer', layerName, 'to', filename)
+        saveDataURLtoFile(canvas.toDataURL(), filename)
+      } else {
+        // is there a layer?
+        if (board.layers[layerName]) {
+          // delete the layer
+          console.log('\tdeleting layer data for', layerName)
+          delete board.layers[layerName]
+          // NOTE we DO NOT delete the PNG file from the file system
+        }
+      }
+    }
+
+    // update the thumbnail
+    //
+    // explicitly indicate to renderer that the thumbnail file has changed
+    // FIXME use mtime instead of etags?
+    setEtag(path.join(boardPath, 'images', boardModel.boardFilenameForThumbnail(board)))
+    // save
+    let index = await saveThumbnailFile(boardData.boards.indexOf(board))
+    // render thumbnail
+    await updateThumbnailDisplayFromFile(index)
+
+    // save a posterframe for onion skin
+    await savePosterFrame(board, true)
+
+    // FIXME known issue: onion skin does not reload to reflect the changed file
+    //       see: https://github.com/wonderunit/storyboarder/issues/1185
   }
-  return
 }
 
 // // always currentBoard
@@ -2275,19 +2874,31 @@ const getThumbnailSize = boardData => [Math.floor(60 * boardData.aspectRatio) * 
 const renderThumbnailToNewCanvas = (index, options = { forceReadFromFiles: false }) => {
   let size = getThumbnailSize(boardData)
 
-  let context = createSizedContext(size)
-  fillContext(context, 'white')
-  let canvas = context.canvas
+  if (!options.forceReadFromFiles && index === currentBoard) {
+    // grab from current sketchpane (in memory)
+    let canvas = SketchPaneUtil.pixelsToCanvas(
+      storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+        size[0],
+        size[1],
+        storyboarderSketchPane.visibleLayersIndices
+      ),
+      size[0],
+      size[1]
+    )
 
-  let canvasImageSources
-  if (!options.forceReadFromFiles && index == currentBoard) {
-    // grab from memory
-    canvasImageSources = storyboarderSketchPane.getCanvasImageSources()
-    // render to context
-    exporterCommon.flattenCanvasImageSourcesDataToContext(context, canvasImageSources, size)
+    // draw a white matte background behind the transparent art
+    let context = canvas.getContext('2d')
+    context.globalCompositeOperation = 'destination-over'
+    context.fillStyle = '#ffffff'
+    context.fillRect(0, 0, canvas.width, canvas.height)
+
     return Promise.resolve(canvas)
   } else {
     // grab from files
+    let context = createSizedContext(size)
+    fillContext(context, 'white')
+    let canvas = context.canvas
+
     return exporterCommon.flattenBoardToCanvas(
       boardData.boards[index],
       canvas,
@@ -2311,7 +2922,7 @@ const saveThumbnailFile = async (index, options = { forceReadFromFiles: false })
 
   fs.writeFileSync(imageFilePath, imageData, 'base64')
 
-  console.log('saved thumbnail', imageFilePath, 'at index:', index)
+  console.log('saved thumbnail', path.basename(imageFilePath), 'at index:', index)
 
   return index
 }
@@ -2352,15 +2963,16 @@ const updateThumbnailDisplayFromMemory = () => {
   })
 }
 
-const setThumbnailDisplayAsPending = async (index) => {
-  let size = getThumbnailSize(boardData)
-  let context = createSizedContext(size)
-  fillContext(context, 'white')
-  let imageData = context.canvas.toDataURL('image/png')
-
-  // cache image
-  srcByUid[boardData.boards[index].uid] = imageData
-}
+// DEPRECATED
+// const setThumbnailDisplayAsPending = async (index) => {
+//   let size = getThumbnailSize(boardData)
+//   let context = createSizedContext(size)
+//   fillContext(context, 'white')
+//   let imageData = context.canvas.toDataURL('image/png')
+// 
+//   // cache image
+//   srcByUid[boardData.boards[index].uid] = imageData
+// }
 
 let deleteSingleBoard = (index) => {
   if (boardData.boards.length > 1) {
@@ -2371,6 +2983,8 @@ let deleteSingleBoard = (index) => {
 }
 
 let deleteBoards = (args)=> {
+  let numDeleted = 0
+
   if (boardData.boards.length > 1) {
     if (selections.size) {
       storeUndoStateForScene(true)
@@ -2392,32 +3006,37 @@ let deleteBoards = (args)=> {
       selections.clear()
       renderThumbnailDrawer()
       storeUndoStateForScene()
-      if (arr.length > 1) {
-        notifications.notify({message: "Deleted " + arr.length + " boards.", timing: 5})
-      } else {
-        notifications.notify({message: "Deleted board.", timing: 5})
-      }
+      numDeleted = arr.length
+      // if (arr.length > 1) {
+      //   // notifications.notify({message: "Deleted " + arr.length + " boards.", timing: 5})
+      // } else {
+      //   // notifications.notify({message: "Deleted board.", timing: 5})
+      // }
 
     } else {
       // delete a single board
       storeUndoStateForScene(true)
       deleteSingleBoard(currentBoard)
       storeUndoStateForScene()
-      notifications.notify({message: "Deleted board", timing: 5})
+      // notifications.notify({message: "Deleted board.", timing: 5})
 
       // if not requested to move forward
       // we take action to move intentionally backward
       if (!args) {
         currentBoard--
       }
+      numDeleted = 1
     }
     gotoBoard(currentBoard)
     sfx.playEffect('trash')
     sfx.negative()
   } else {
-    sfx.error()
-    notifications.notify({message: "Cannot delete. You have to have at least one board, silly.", timing: 8})
+    // sfx.error()
+    // notifications.notify({message: "Cannot delete. You have to have at least one board, silly.", timing: 8})
+    numDeleted = 0
   }
+
+  return numDeleted
 }
 
 /**
@@ -2441,32 +3060,46 @@ let duplicateBoard = async () => {
   let boardDst = migrateBoards([util.stringifyClone(boardSrc)], insertAt)[0]
 
   // Per Taino's request, we are not duplicating some metadata
+
+  boardDst.audio = null
+  boardDst.newShot = false
   boardDst.dialogue = ''
   boardDst.action = ''
   boardDst.notes = ''
-  boardDst.duration = 0
+  boardDst.duration = boardSrc.duration // either `undefined` or a value in msecs
 
   try {
     // console.log('copying files from index', currentBoard, 'to index', insertAt)
-    let filePairs = []
-    // main
-    filePairs.push({ from: boardSrc.url, to: boardDst.url })
-    // reference
-    if (boardSrc.layers.reference) {
-      filePairs.push({ from: boardSrc.layers.reference.url, to: boardDst.layers.reference.url })
-    }
-    // notes
-    if (boardSrc.layers.notes) {
-      filePairs.push({ from: boardSrc.layers.notes.url, to: boardDst.layers.notes.url })
-    }
-    // thumbnail
-    filePairs.push({ from: boardModel.boardFilenameForThumbnail(boardSrc), to: boardModel.boardFilenameForThumbnail(boardDst) })
 
-    // link (if any)
+    // every layer
+    let filePairs = boardSrc.layers
+      ? Object.keys(boardSrc.layers)
+        .map(name =>
+          ({
+            from: boardSrc.layers[name].url,
+            to: boardDst.layers[name].url
+          }))
+      : []
+
+    // thumbnail
+    filePairs.push({
+      from: boardModel.boardFilenameForThumbnail(boardSrc),
+      to: boardModel.boardFilenameForThumbnail(boardDst)
+    })
+
+    // posterframe
+    filePairs.push({
+      from: boardModel.boardFilenameForPosterFrame(boardSrc),
+      to: boardModel.boardFilenameForPosterFrame(boardDst)
+    })
+
+    // is there an existing link?
     if (boardSrc.link) {
-      let from = boardSrc.link
-      let to = boardDst.link
-      filePairs.push({ from, to })
+      // make a copy with the new name
+      filePairs.push({
+        from: boardSrc.link,
+        to: boardModel.boardFilenameForLink(boardDst)
+      })
     }
 
     // NOTE: audio is not copied
@@ -2486,12 +3119,12 @@ let duplicateBoard = async () => {
     }
 
     for (let { from, to } of filePairs) {
+      // console.log('duplicate is copying from', from, 'to', to)
       fs.writeFileSync(to, fs.readFileSync(from))
     }
 
     // insert data
     boardData.boards.splice(insertAt, 0, boardDst)
-
     markBoardFileDirty()
     storeUndoStateForScene()
 
@@ -2522,15 +3155,22 @@ let duplicateBoard = async () => {
 const clearLayers = shouldEraseCurrentLayer => {
   if (storyboarderSketchPane.preventIfLocked()) return
 
-  if (toolbar.state.brush !== 'eraser' && (isCommandPressed('drawing:clear-current-layer-modifier') || shouldEraseCurrentLayer)) {
+  if (store.getState().toolbar.activeTool !== 'eraser' &&
+      (isCommandPressed('drawing:clear-current-layer-modifier') || shouldEraseCurrentLayer)) {
     storyboarderSketchPane.clearLayers([storyboarderSketchPane.sketchPane.getCurrentLayerIndex()])
     saveImageFile()
     sfx.playEffect('trash')
     notifications.notify({ message: 'Cleared current layer.', timing: 5 })
   } else {
     if (storyboarderSketchPane.isEmpty()) {
-      deleteBoards()
-      notifications.notify({ message: 'Deleted board.', timing: 5 })
+      let numDeleted = deleteBoards()
+      if (numDeleted > 0) {
+        let noun = `board${numDeleted > 1 ? 's' : ''}`
+        notifications.notify({
+          message: `Deleted ${numDeleted} ${noun}.`,
+          timing: 5
+        })
+      }
     } else {
       storyboarderSketchPane.clearLayers()
       saveImageFile()
@@ -2544,29 +3184,49 @@ const clearLayers = shouldEraseCurrentLayer => {
 // UI Rendering
 ///////////////////////////////////////////////////////////////
 
+// TODO handle selections / shouldPreserveSelections ?
+// TODO handle re-ordering?
 let goNextBoard = async (direction, shouldPreserveSelections = false) => {
-  await saveImageFile()
+  let index
 
-  if (direction) {
-    currentBoard += direction
+  index = direction
+    ? currentBoard + direction
+    : currentBoard + 1
+
+  index = Math.min(Math.max(index, 0), boardData.boards.length - 1)
+
+  if (index !== currentBoard) {
+    console.log(index, '!==', currentBoard)
+    await saveImageFile()
+    currentBoard = index
+    console.log('calling gotoBoard')
+    await gotoBoard(currentBoard, shouldPreserveSelections)
   } else {
-    currentBoard++
+    console.log('not calling gotoBoard')
   }
-
-  await gotoBoard(currentBoard, shouldPreserveSelections)
 }
 
 let gotoBoard = (boardNumber, shouldPreserveSelections = false) => {
   if(isRecording && isRecordingStarted) {
     // make sure we capture the last frame
+    // grab full-size image from current sketchpane (in memory)
+    let pixels = storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+      storyboarderSketchPane.sketchPane.width,
+      storyboarderSketchPane.sketchPane.height,
+      storyboarderSketchPane.visibleLayersIndices
+    )
+    // un-premultiply
+    SketchPaneUtil.arrayPostDivide(pixels)
     canvasRecorder.capture([
-      storyboarderSketchPane.sketchPane.getLayerCanvas(0),
-      storyboarderSketchPane.sketchPane.getLayerCanvas(1),
-      storyboarderSketchPane.sketchPane.getLayerCanvas(3)
+      SketchPaneUtil.pixelsToCanvas(
+        pixels,
+        storyboarderSketchPane.sketchPane.width,
+        storyboarderSketchPane.sketchPane.height
+      )
     ], {force: true, duration: 500})
   }
 
-  toolbar.emit('cancelTransform')
+  // toolbar.emit('cancelTransform')
   return new Promise((resolve, reject) => {
     clearTimeout(drawIdleTimer)
 
@@ -2635,17 +3295,22 @@ let gotoBoard = (boardNumber, shouldPreserveSelections = false) => {
       StsSidebar.reset(board.sts)
     }
 
-    guides.setPerspectiveParams({
+    guides && guides.setPerspectiveParams({
       cameraParams: board.sts && board.sts.camera,
       rotation: 0
     })
 
     ipcRenderer.send('analyticsEvent', 'Board', 'go to board', null, currentBoard)
 
-    updateSketchPaneBoard().then(() => {
-      audioPlayback.playBoard(currentBoard)
-      resolve()
-    }).catch(e => console.error(e))
+    updateSketchPaneBoard()
+      .then(() => {
+        audioPlayback.playBoard(currentBoard)
+        resolve()
+      }).catch(e => {
+        console.log('gotoBoard could not updateSketchPaneBoard')
+        console.error(e)
+        reject(e)
+      })
   })
 }
 
@@ -2695,9 +3360,6 @@ let renderMetaData = () => {
   if (boardData.boards[currentBoard].newShot) {
     document.querySelector('input[name="newShot"]').checked = true
   }
-  if (!boardData.boards[currentBoard].dialogue) {
-    document.querySelector('#canvas-caption').style.display = 'none'
-  }
 
   if (boardData.boards[currentBoard].duration) {
     if (selections.size == 1) {
@@ -2708,7 +3370,9 @@ let renderMetaData = () => {
         label && label.classList.remove('disabled')
       }
 
-      document.querySelector('input[name="duration"]').value = boardData.boards[currentBoard].duration
+      document.querySelector('input[name="duration"]').value = boardData.boards[currentBoard].duration != null
+        ? boardData.boards[currentBoard].duration
+        : ''
       document.querySelector('input[name="frames"]').value = msecsToFrames(boardData.boards[currentBoard].duration)
     } else {
       for (let input of editableInputs) {
@@ -2722,8 +3386,10 @@ let renderMetaData = () => {
       if (uniqueDurations.length == 1) {
         // unified
         let duration = uniqueDurations[0]
-        document.querySelector('input[name="duration"]').value = duration
-        document.querySelector('input[name="frames"]').value = msecsToFrames(duration)
+        document.querySelector('input[name="duration"]').value = duration != null
+          ? duration
+          : ''
+        document.querySelector('input[name="frames"]').value = msecsToFrames(boardModel.boardDuration(boardData, boardData.boards[currentBoard].duration))
       } else {
         document.querySelector('input[name="duration"]').value = null
         document.querySelector('input[name="frames"]').value = null
@@ -2733,12 +3399,13 @@ let renderMetaData = () => {
 
   if (boardData.boards[currentBoard].dialogue) {
     document.querySelector('textarea[name="dialogue"]').value = boardData.boards[currentBoard].dialogue
-    renderCaption()
-    document.querySelector('#canvas-caption').style.display = 'block'
-    document.querySelector('#suggested-dialogue-duration').innerHTML = util.durationOfWords(boardData.boards[currentBoard].dialogue, 300)+300 + "ms"
-  } else {
-    document.querySelector('#suggested-dialogue-duration').innerHTML = ''
+    let suggestionDuration = document.querySelector('#suggested-dialogue-duration')
+    let duration = util.durationOfWords(boardData.boards[currentBoard].dialogue, 300)+300
+    suggestionDuration.innerHTML = "// about " + (duration/1000) + " seconds"
+    suggestionDuration.dataset.duration = duration
   }
+  renderCaption()
+
   if (boardData.boards[currentBoard].action) {
     document.querySelector('textarea[name="action"]').value = boardData.boards[currentBoard].action
   }
@@ -2763,7 +3430,13 @@ let renderMetaData = () => {
 }
 
 const renderCaption = () => {
-  document.querySelector('#canvas-caption').innerHTML = boardData.boards[currentBoard].dialogue
+  if (boardData.boards[currentBoard].dialogue) {
+    document.querySelector('#canvas-caption').innerHTML = boardData.boards[currentBoard].dialogue
+    document.querySelector('#canvas-caption').style.display = 'block'
+  } else {
+    document.querySelector('#suggested-dialogue-duration').innerHTML = ''
+    document.querySelector('#canvas-caption').style.display = 'none'
+  }
 }
 
 const renderMetaDataLineMileage = () => {
@@ -2853,6 +3526,7 @@ let nextScene = ()=> {
       saveBoardFile()
       currentScene++
       loadScene(currentScene).then(() => {
+        migrateScene()
         verifyScene()
         renderScript()
         renderScene()
@@ -2879,6 +3553,7 @@ let previousScene = ()=> {
       currentScene--
       currentScene = Math.max(0, currentScene)
       loadScene(currentScene).then(() => {
+        migrateScene()
         verifyScene()
         renderScript()
         renderScene()
@@ -2895,107 +3570,171 @@ let previousScene = ()=> {
   }
 }
 
-let updateSketchPaneBoard = () => {
-  return new Promise((resolve, reject) => {
-    // get current board
-    let board = boardData.boards[currentBoard]
-    
 
-    // always load the main layer
-    let layersData = [
-      [1, board.url] // HACK hardcoded index
-    ]
-    // load other layers when available
-    if (board.layers) {
-      if (board.layers.reference && board.layers.reference.url) {
-        layersData.push([0, board.layers.reference.url]) // HACK hardcoded index
-      }
-      if (board.layers.notes && board.layers.notes.url) {
-        layersData.push([3, board.layers.notes.url]) // HACK hardcoded index
-      }
+const loadPosterFrame = async board => {
+  let lastModified
+  let filename = boardModel.boardFilenameForPosterFrame(board)
+  let imageFilePath = path.join(boardPath, 'images', filename)
+  imageFilePath = imageFilePath + '?' + cacheKey(imageFilePath)
+
+  try {
+    let image = await exporterCommon.getImage(imageFilePath)
+    storyboarderSketchPane.sketchPane.replaceLayer(
+      storyboarderSketchPane.sketchPane.layers.findByName('composite').index,
+      image
+    )
+    console.log('loadPosterFrame rendered jpg')
+    return true
+  } catch (err) {
+    console.log('loadPosterFrame failed')
+    return false
+  }
+}
+const clearPosterFrame = () => {
+  console.log('clearPosterFrame')
+  storyboarderSketchPane.clearLayer(
+    storyboarderSketchPane.sketchPane.layers.findByName('composite').index
+  )
+}
+
+// HACK draw a fake poster frame to occlude the view
+// TODO we could instead hide/show the layers via PIXI.Sprite#visible?
+const renderFakePosterFrame = () => {
+  let canvas = document.createElement('canvas')
+  let context = canvas.getContext('2d')
+
+  canvas.width = storyboarderSketchPane.sketchPane.width
+  canvas.height = storyboarderSketchPane.sketchPane.height
+
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  // context.fillStyle = '#000000'
+  // context.font = '24px serif'
+  // context.fillText('Loading …', (canvas.width - 50) / 2, canvas.height / 2)
+  // context.globalAlpha = 0.5
+
+  let layer = storyboarderSketchPane.sketchPane.layers.findByName('composite')
+  layer.replaceTextureFromCanvas(canvas)
+  // TODO remove the canvas from PIXI cache?
+
+  console.log('loadPosterFrame rendered white canvas')
+}
+
+let loaderIds = 0
+function * loadSketchPaneLayers (signal, board, indexToLoad) {
+  const loaderId = ++loaderIds
+
+  const imagesPath = path.join(boardPath, 'images')
+
+  // show the poster frame
+  let hasPosterFrame = yield loadPosterFrame(board)
+
+  // reset zoom/pan
+  zoomIndex = ZOOM_CENTER
+  storyboarderSketchPane.zoomCenter(ZOOM_LEVELS[zoomIndex])
+
+  if (!hasPosterFrame) renderFakePosterFrame()
+
+  // HACK yield to get key input and cancel if necessary
+  yield CAF.delay(signal, 1)
+
+  // queue up image files for load
+  let loadables = []
+  // for every layer index
+  for (let index of storyboarderSketchPane.visibleLayersIndices) {
+    // get the layer
+    let layer = storyboarderSketchPane.sketchPane.layers[index]
+
+    // clear the layer
+    storyboarderSketchPane.clearLayer(index)
+
+    // do we have data for a layer by this name?
+    if (board.layers && board.layers[layer.name] && board.layers[layer.name].url) {
+      let filename = board.layers[layer.name].url
+      let filepath = path.join(imagesPath, filename)
+      loadables.push({ index, filepath })
     }
+  }
 
+  for (let { index, filepath } of loadables) {
+    console.log(`[${loaderId}] load layer`, index, path.basename(filepath))
 
-    let loaders = []
-    for (let [index, filename] of layersData) {
-      loaders.push(new Promise((resolve, reject) => {
-        let imageFilePath = path.join(boardPath, 'images', filename)
-        try {
-          if (fs.existsSync(imageFilePath)) {
-            let image = new Image()
-            image.onload = () => {
-              // draw
-              resolve([index, image])
-            }
-            image.onerror = () => {
-              // clear
-              console.warn('updateSketchPaneBoard could not load', filename)
-              resolve([index, null])
-            }
-            image.src = imageFilePath + '?' + Math.random()
-          } else {
-            // clear
-            resolve([index, null])
-          }
-        } catch (err) {
-          // clear
-          resolve([index, null])
-        }
-      }))
-    }
+    let image = yield exporterCommon.getImage(filepath + '?' + cacheKey(filepath))
+    storyboarderSketchPane.sketchPane.replaceLayer(index, image)
 
+    // HACK yield to get key input and cancel if necessary
+    yield CAF.delay(signal, 1)
 
-    Promise.all(loaders).then(result => {
-      const visibleLayerIndexes = [0, 1, 3] // HACK hardcoded
+    // uncomment to test slow loading
+    // yield CAF.delay(signal, 500)
+  }
 
-      // key map for easier lookup
-      let layersToDrawByIndex = []
-      for (let [index, image] of result) {
-        if (image) {
-          layersToDrawByIndex[index] = image
-        }
-      }
+  // if a link exists, lock the board
+  storyboarderSketchPane.setIsLocked(board.link != null)
+  
+  // load opacity from data, if data exists
+  let referenceOpacity = board.layers &&
+                         board.layers.reference &&
+                         typeof board.layers.reference.opacity !== 'undefined'
+    ? board.layers.reference.opacity
+    : exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY
+  layersEditor.setReferenceOpacity(referenceOpacity)
 
-      // loop through ALL visible layers
-      for (let index of visibleLayerIndexes) {
-        let image = layersToDrawByIndex[index]
+  clearPosterFrame()
 
-        let context = storyboarderSketchPane.sketchPane.getLayerCanvas(index).getContext('2d')
-        context.globalAlpha = 1
+  // no poster frame was found earlier
+  if (!hasPosterFrame) {
+    // force a posterframe save
+    yield savePosterFrame(board, indexToLoad !== currentBoard)
+  }
+}
 
-        // do we have an image for this particular layer index?
-        if (image) {
-          // console.log('rendering layer index:', index)
-          storyboarderSketchPane.sketchPane.clearLayer(index)
-          context.drawImage(image, 0, 0)
-        } else {
-          // console.log('clearing layer index:', index)
-          storyboarderSketchPane.sketchPane.clearLayer(index)
-        }
-      }
+const updateSketchPaneBoard = async () => {
+  console.log(`%cupdateSketchPaneBoard`, 'color:purple')
 
-      storyboarderSketchPane.setIsLocked( !util.isUndefined(board.link) )
+  // cancel any in-progress loading
+  if (cancelTokens.updateSketchPaneBoard && !cancelTokens.updateSketchPaneBoard.signal.aborted) {
+    console.log(`%ccanceling in-progress load`, 'color:red')
+    cancelTokens.updateSketchPaneBoard.abort('cancel')
+    cancelTokens.updateSketchPaneBoard = undefined
+  }
 
-      // load opacity from data, if data exists
-      let referenceOpacity =  board.layers && 
-                              board.layers[LAYER_NAME_BY_INDEX[LAYER_INDEX_REFERENCE]] && 
-                              typeof board.layers[LAYER_NAME_BY_INDEX[LAYER_INDEX_REFERENCE]].opacity !== 'undefined'
-        ? board.layers[LAYER_NAME_BY_INDEX[LAYER_INDEX_REFERENCE]].opacity
-        : exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY
-      layersEditor.setReferenceOpacity(referenceOpacity)
+  // start a new loading process
+  cancelTokens.updateSketchPaneBoard = new CAF.cancelToken()
 
-      onionSkin.reset()
-      if (onionSkin.getEnabled()) {
-        onionSkin.load(
-          boardData.boards[currentBoard],
-          boardData.boards[currentBoard - 1],
-          boardData.boards[currentBoard + 1]
-        ).then(() => resolve()).catch(err => console.warn(err))
-      } else {
-        resolve()
-      }
-    }).catch(err => console.warn(err))
-  })
+  console.log(`%cloadSketchPaneLayers`, 'color:orange')
+
+  // get current board
+  let indexToLoad = currentBoard
+
+  let board = boardData.boards[indexToLoad]
+
+  // load and render the layers
+  try {
+    let cancelable = CAF(loadSketchPaneLayers)
+    let signal = cancelTokens.updateSketchPaneBoard.signal
+    await cancelable(signal, board, indexToLoad)
+  } catch (err) {
+    console.log('failed loadSketchPaneLayers')
+    console.warn(err)
+  }
+
+  // load and render the onion skin
+  try {
+    // configure onion skin
+    onionSkin.setState({
+      pathToImages: path.join(boardPath, 'images'),
+      currBoard: boardData.boards[indexToLoad],
+      prevBoard: boardData.boards[indexToLoad - 1],
+      nextBoard: boardData.boards[indexToLoad + 1],
+      enabled: store.getState().toolbar.onion
+    })
+    await onionSkin.load(cancelTokens.updateSketchPaneBoard)
+  } catch (err) {
+    console.log('failed onionSkin.load')
+    console.error(err)
+  }
 }
 
 let renderThumbnailDrawerSelections = () => {
@@ -3049,7 +3788,7 @@ const updateSceneTiming = () => {
 }
 
 const renderSceneTimeline = () => {
-  sceneTimelineView.update({
+  sceneTimelineView && sceneTimelineView.update({
     scene: boardData,
     currentBoardIndex: currentBoard
   })
@@ -3058,10 +3797,19 @@ const renderSceneTimeline = () => {
 let renderThumbnailDrawer = () => {
   updateSceneTiming()
 
-  // update the mode control
-  timelineModeControlView.update({
-    mode: shouldRenderThumbnailDrawer ? 'sequence' : 'time'
-  })
+  // for new script-based projects,
+  // the order the ui is setup is different
+  // and we might not have an instance yet
+  //
+  // TODO a better solution would be
+  //      to ensure timelineModeControlView is present
+  //      before newBoard is called
+  if (timelineModeControlView) {
+    // update the mode control
+    timelineModeControlView.update({
+      mode: shouldRenderThumbnailDrawer ? 'sequence' : 'time'
+    })
+  }
 
   // reflect the current view
   cycleViewMode(0)
@@ -3159,7 +3907,14 @@ let renderThumbnailDrawer = () => {
       }).catch(err => console.error(err))
     })
     contextMenu.on('delete', () => {
-      deleteBoards()
+      let numDeleted = deleteBoards()
+      if (numDeleted > 0) {
+        let noun = `board${numDeleted > 1 ? 's' : ''}`
+        notifications.notify({
+          message: `Deleted ${numDeleted} ${noun}.`,
+          timing: 5
+        })
+      }
     })
     contextMenu.on('duplicate', () => {
       duplicateBoard()
@@ -3171,9 +3926,13 @@ let renderThumbnailDrawer = () => {
     })
     contextMenu.on('copy', () => {
       copyBoards()
+        .then(() => notifications.notify({
+          message: 'Copied board(s) to clipboard.', timing: 5
+        }))
+        .catch(err => {})
     })
     contextMenu.on('paste', () => {
-      pasteBoards()
+      pasteBoards().catch(err => {})
     })
     contextMenu.on('import', () => {
       // TODO could move the dialog code out of main.js and call it directly here via remote.dialog
@@ -3375,6 +4134,7 @@ let renderScenes = () => {
       if (currentScene !== Number(e.target.dataset.node)) {
         currentScene = Number(e.target.dataset.node)
         loadScene(currentScene).then(() => {
+          migrateScene()
           verifyScene()
           renderScript()
           renderScene()
@@ -3685,10 +4445,6 @@ let loadScene = async (sceneNumber) => {
     boardPath = boardPath.join(path.sep)
     console.log('BOARD PATH:', boardPath)
 
-    if (onionSkin) {
-      onionSkin.setBoardPath(boardPath)
-    }
-
     dragTarget = document.querySelector('#thumbnail-container')
     dragTarget.style.scrollBehavior = 'unset'
 
@@ -3705,18 +4461,6 @@ const ensureBoardExists = async () => {
   if (boardData.boards.length == 0) {
     // create a new board
     await newBoard(0, false)
-
-    // create a placeholder main.png image so verifyScene won't squawk
-    let size = boardModel.boardFileImageSize(boardData)
-    let context = createSizedContext(size)
-    let canvas = context.canvas
-    let imageData = canvas.toDataURL()
-    saveDataURLtoFile(imageData, boardData.boards[0].url)
-
-    // create a placeholder thumbnail image
-    await saveThumbnailFile(0, { forceReadFromFiles: true })
-  } else {
-    return
   }
 }
 
@@ -3772,17 +4516,22 @@ window.onkeydown = (e)=> {
     if (isCommandPressed('menu:edit:copy')) {
       e.preventDefault()
       copyBoards()
-      notifications.notify({ message: 'Copied board(s) to clipboard.', timing: 5 })
+        .then(() => notifications.notify({
+          message: 'Copied board(s) to clipboard.', timing: 5
+        }))
+        .catch(err => {})
 
     } else if (isCommandPressed('menu:edit:cut')) {
       e.preventDefault()
       copyBoards()
-      deleteBoards()
-      notifications.notify({ message: 'Cut board(s) to clipboard.', timing: 5 })
+        .then(() => {
+          deleteBoards()
+          notifications.notify({ message: 'Cut board(s) to clipboard.', timing: 5 })
+        }).catch(err => {})
 
     } else if (isCommandPressed('menu:edit:paste')) {
       e.preventDefault()
-      pasteBoards()
+      pasteBoards().catch(err => {})
 
     } else if (isCommandPressed('menu:edit:redo')) {
       e.preventDefault()
@@ -3842,37 +4591,6 @@ window.onkeydown = (e)=> {
       e.preventDefault()
       togglePlayback()
     }
-
-    // r
-    // case 82:
-    //   if(isRecording) {
-    //     let snapshotCanvases = [
-    //       storyboarderSketchPane.sketchPane.getLayerCanvas(0),
-    //       storyboarderSketchPane.sketchPane.getLayerCanvas(1),
-    //       storyboarderSketchPane.sketchPane.getLayerCanvas(3)
-    //     ]
-    //     // make sure we capture the last frame
-    //     canvasRecorder.capture(snapshotCanvases, {force: true})
-    //     canvasRecorder.stop()
-    //     isRecording = false
-    //     isRecordingStarted = false
-    //   } else {
-    //     isRecording = true
-
-    //     let outputStrategy = "CanvasBufferOutputGifStrategy"
-    //     if (e.metaKey || e.ctrlKey) {
-    //       outputStrategy = "CanvasBufferOutputFileStrategy"
-    //     }
-    //     let exportsPath = exporterCommon.ensureExportsPathExists(boardFilename)
-    //     canvasRecorder = new CanvasRecorder({
-    //       exportsPath: exportsPath,
-    //       outputStrategy: outputStrategy,
-    //       recordingStrategy: "RecordingStrategyFrameRatio", //"RecordingStrategyTimeRatio",
-    //       recordingTime: 10,
-    //       outputTime: 1,
-    //     })
-    //     canvasRecorder.start()
-    //   }
   }
 
   if (!textInputMode || textInputAllowAdvance) {
@@ -4014,8 +4732,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 1:
         document.querySelector('#scenes').style.display = 'none'
@@ -4025,8 +4747,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 2:
         document.querySelector('#scenes').style.display = 'none'
@@ -4036,8 +4762,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 3:
         document.querySelector('#scenes').style.display = 'none'
@@ -4047,8 +4777,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 4:
         document.querySelector('#scenes').style.display = 'none'
@@ -4058,8 +4792,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 5:
         document.querySelector('#scenes').style.display = 'none'
@@ -4069,8 +4807,12 @@ let cycleViewMode = async (direction = +1) => {
         document.querySelector('#thumbnail-container').style.display = 'none'
         document.querySelector('#timeline').style.display = 'none'
         document.querySelector('#playback #icons').style.display = 'none'
-        await sceneTimelineView.update({ show: false })
-        timelineModeControlView.update({ show: false })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: false })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: false })
+        }
         break
     }
   } else {
@@ -4085,8 +4827,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 1:
         document.querySelector('#scenes').style.display = 'none'
@@ -4096,8 +4842,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 2:
         document.querySelector('#scenes').style.display = 'none'
@@ -4107,8 +4857,12 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = shouldRenderThumbnailDrawer ? 'block' : 'none'
         document.querySelector('#timeline').style.display = shouldRenderThumbnailDrawer ? 'flex' : 'none'
-        await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
-        timelineModeControlView.update({ show: true })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: !shouldRenderThumbnailDrawer })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: true })
+        }
         break
       case 3:
         document.querySelector('#scenes').style.display = 'none'
@@ -4119,12 +4873,16 @@ let cycleViewMode = async (direction = +1) => {
 
         document.querySelector('#thumbnail-container').style.display = 'none'
         document.querySelector('#timeline').style.display = 'none'
-        await sceneTimelineView.update({ show: false })
-        timelineModeControlView.update({ show: false })
+        if (sceneTimelineView) {
+          await sceneTimelineView.update({ show: false })
+        }
+        if (timelineModeControlView) {
+          timelineModeControlView.update({ show: false })
+        }
         break
     }
   }
-  storyboarderSketchPane.resize()
+  // storyboarderSketchPane.resize()
   renderViewMode()
   renderStats()
 }
@@ -4140,10 +4898,6 @@ const renderViewMode = () => {
   )
 }
 
-const toggleCaptions = () => {
-  toolbar.toggleCaptions()
-}
-
 const toggleTimeline = () => {
   shouldRenderThumbnailDrawer = !shouldRenderThumbnailDrawer
   // timelineModeControlView.update({
@@ -4155,6 +4909,7 @@ const toggleTimeline = () => {
 }
 
 ipcRenderer.on('newBoard', (event, args)=>{
+  // TODO fix doubling bug https://github.com/wonderunit/storyboarder/issues/1206
   if (!textInputMode) {
     if (args > 0) {
       // insert after
@@ -4207,7 +4962,14 @@ ipcRenderer.on('nextScene', (event, args)=>{
 
 ipcRenderer.on('undo', (e, arg) => {
   if (textInputMode) {
-    remote.getCurrentWebContents().undo()
+    // HACK because remote.getCurrentWindow().webContents returns the parent window
+    for (let w of remote.getCurrentWindow().getChildWindows()) {
+      if (w.isFocused()) {
+        w.webContents.undo()
+        return
+      }
+    }
+    remote.getCurrentWindow().webContents.undo()
   } else {
     if (storyboarderSketchPane.preventIfLocked()) return
 
@@ -4223,7 +4985,14 @@ ipcRenderer.on('undo', (e, arg) => {
 
 ipcRenderer.on('redo', (e, arg) => {
   if (textInputMode) {
-    remote.getCurrentWebContents().redo()
+    // HACK because remote.getCurrentWindow().webContents returns the parent window
+    for (let w of remote.getCurrentWindow().getChildWindows()) {
+      if (w.isFocused()) {
+        w.webContents.redo()
+        return
+      }
+    }
+    remote.getCurrentWindow().webContents.redo()
   } else {
     if (storyboarderSketchPane.preventIfLocked()) return
 
@@ -4237,66 +5006,110 @@ ipcRenderer.on('redo', (e, arg) => {
   }
 })
 
-ipcRenderer.on('copy', () => {
+ipcRenderer.on('copy', event => {
+  if (remote.getCurrentWindow().webContents.isDevToolsFocused()) {
+    remote.getCurrentWindow().webContents.devToolsWebContents.executeJavaScript(
+      `document.execCommand('copy')`
+    )
+    return
+  }
+
   if (textInputMode) {
-    remote.getCurrentWebContents().copy()
+    // HACK because remote.getCurrentWindow().webContents returns the parent window
+    for (let w of remote.getCurrentWindow().getChildWindows()) {
+      if (w.isFocused()) {
+        // console.log('copying from child', w)
+        w.webContents.copy()
+        return
+      }
+    }
+
+    // console.log('copying from parent')
+    remote.getCurrentWindow().webContents.copy()
   } else {
     copyBoards()
+      .then(() => notifications.notify({
+        message: 'Copied board(s) to clipboard.', timing: 5
+      }))
+      .catch(err => {})
   }
 })
 
 ipcRenderer.on('paste', () => {
+  if (remote.getCurrentWindow().webContents.isDevToolsFocused()) {
+    remote.getCurrentWindow().webContents.devToolsWebContents.executeJavaScript(
+      `document.execCommand('paste')`
+    )
+    return
+  }
+
   if (textInputMode) {
-    remote.getCurrentWebContents().paste()
+    // HACK because remote.getCurrentWindow().webContents returns the parent window
+    for (let w of remote.getCurrentWindow().getChildWindows()) {
+      if (w.isFocused()) {
+        // console.log('pasting to child', w)
+        w.webContents.paste()
+        return
+      }
+    }
+
+    // console.log('pasting to parent')
+    remote.getCurrentWindow().webContents.paste()
   } else {
-    pasteBoards()
+    pasteBoards().catch(err => {})
   }
 })
 
 // import image from mobile server
-let importImage = imageDataURL => {
-  // TODO: undo
+const importImage = async imageDataURL => {
+  let board = boardData.boards[currentBoard]
 
-  console.log('importImage')
+  // resize image if too big
+  let dim = [
+    storyboarderSketchPane.sketchPane.width,
+    storyboarderSketchPane.sketchPane.height
+  ]
+  const scaledImageData = await fitImageData(dim, imageDataURL)
+  let image = await exporterCommon.getImage(scaledImageData)
 
-  let image = new Image()
-  image.addEventListener('load', () => {
-    console.log(boardData.aspectRatio)
-    console.log((image.height/image.width))
-    console.log(image)
+  let layer = storyboarderSketchPane.sketchPane.layers.findByName('reference')
 
-    let targetWidth
-    let targetHeight
-    let offsetX
-    let offsetY
-
-    if (boardData.aspectRatio > (image.height/image.width)) {
-      targetHeight = 900
-      targetWidth = 900 * (image.width/image.height)
-
-      offsetX = Math.round(((900 * boardData.aspectRatio) - targetWidth)/2)
-      offsetY = 0
-    } else {
-      targetWidth = 900 * boardData.aspectRatio
-      targetHeight = targetWidth * (image.width/image.height)
-
-      offsetY = Math.round(900 - targetHeight)
-      offsetX = 0
+  // update the board data
+  storeUndoStateForScene(true)
+  layersEditor.setReferenceOpacity(1.0)
+  board.layers = {
+    ...board.layers,
+    reference: {
+      ...board.layers.reference,
+      url: boardModel.boardFilenameForLayer(board, layer.name),
+      opacity: 1.0 // alternatively: exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY
     }
+  }
+  storeUndoStateForScene()
+  // mark new board data
+  markBoardFileDirty()
 
-    // render
-    storyboarderSketchPane
-      .getLayerCanvasByName('reference')
-      .getContext("2d")
-      .drawImage(image, offsetX, offsetY, targetWidth, targetHeight)
-    markImageFileDirty([0]) // HACK hardcoded
-    saveImageFile()
-  })
-  image.addEventListener('error', () => {
-    notifications.notify({ message: 'Could not read the image file' })
-  })
+  // update the image
+  storeUndoStateForImage(true, [layer.index])
+  layer.replace(image, false)
+  storeUndoStateForImage(false, [layer.index])
+  // mark new image
+  markImageFileDirty([layer.index])
 
-  image.src = imageDataURL
+  // save the posterframe
+  await savePosterFrame(board)
+
+  // update the thumbnail
+  let index = await saveThumbnailFile(boardData.boards.indexOf(board))
+  await updateThumbnailDisplayFromFile(index)
+
+  // renderThumbnailDrawer()
+
+  notifications.notify({
+    message: `Image added on top of reference layer`,
+    timing: 10
+  })
+  sfx.positive()
 }
 
 /**
@@ -4309,12 +5122,11 @@ let importImage = imageDataURL => {
  * {
  *   boards: [
  *     {
- *       url: ...,
  *       layers: { ... }
  *     }
  *   },
  *   layerDataByBoardIndex: [
- *     'data:image/png;base64,...'
+ *     { reference: 'data:image/png;base64,...', ... }
  *   ]
  * }
  *
@@ -4322,130 +5134,118 @@ let importImage = imageDataURL => {
  * of all visible layers as an 'image' to the clipboard.
  *
  */
-let copyBoards = () => {
+ 
+// TODO cancel token
+let copyBoards = async () => {
   if (textInputMode) return // ignore copy command in text input mode
 
-  if (selections.size > 1) {
-    //
-    //
-    // copy multiple boards
-    //
-    if (selections.has(currentBoard)) {
-      saveImageFile()
-    }
+  try {
+    // list the boards, using a copy of the selection indices set to determine order
+    let boards = [...selections].sort(util.compareNumbers).map(n => boardData.boards[n])
 
-    // make a copy of the board data for each selected board
-    let selectedBoardIndexes = [...selections].sort(util.compareNumbers)
-    let boards = selectedBoardIndexes.map(n => util.stringifyClone(boardData.boards[n]))
+    let multiple = boards.length > 1
 
-    // inject image data for each board
-    let layerDataByBoardIndex = boards.map((board, index) => {
-      let result = {}
-      let filepath = path.join(boardPath, 'images', board.url)
-      let data = FileHelper.getBase64TypeFromFilePath('png', filepath)
-      if (data) {
-        result[LAYER_INDEX_MAIN] = data
-      } else {
-        console.warn("could not load image for board", board.url)
-      }
+    // save all current layers and data to disk
+    await saveImageFile()
 
-      if (board.layers) {
-        for (let [layerName, sym] of [['reference', LAYER_INDEX_REFERENCE], ['notes', LAYER_INDEX_NOTES]]) { // HACK hardcoded
-          if (board.layers[layerName]) {
-            let filepath = path.join(boardPath, 'images', board.layers[layerName].url)
-            let data = FileHelper.getBase64TypeFromFilePath('png', filepath)
-            if (data) {
-              result[sym] = data
-            } else {
-              console.warn("could not load image for board", board.layers[layerName].url)
-            }
-          }
+    // collect layers, by name, for each board
+    let layerDataByBoardIndex = []
+    for (let board of boards) {
+      // all the layers, by name, for this board
+      let layerData = {}
+
+      for (let name of Object.keys(board.layers)) {
+        let filepath = path.join(boardPath, 'images', board.layers[name].url)
+
+        let img = await exporterCommon.getImage(filepath + '?' + cacheKey(filepath))
+        if (img) {
+          let canvas = document.createElement('canvas')
+          let ctx = canvas.getContext('2d')
+          canvas.height = img.naturalHeight
+          canvas.width = img.naturalWidth
+          ctx.drawImage(img, 0, 0)
+          layerData[name] = canvas.toDataURL()
+        } else {
+          console.warn("could not load image for board", board.layers[layerName].url)
         }
       }
 
-      return result
-    })
+      layerDataByBoardIndex.push(layerData)
+    }
+
+    let image = multiple
+      // multiple doesn't include the image
+      ? undefined
+      // a single flattened PNG image (for pasting to external apps)
+      // NOTE assumes that, in the UI, single selection always === current board
+      : nativeImage.createFromDataURL(
+          SketchPaneUtil.pixelsToCanvas(
+            storyboarderSketchPane.sketchPane.extractThumbnailPixels(
+              storyboarderSketchPane.sketchPane.width,
+              storyboarderSketchPane.sketchPane.height,
+              storyboarderSketchPane.visibleLayersIndices
+            ),
+            storyboarderSketchPane.sketchPane.width,
+            storyboarderSketchPane.sketchPane.height
+          ).toDataURL())
 
     let payload = {
+      // if not multiple, we'll have an image for one board (the current board)
+      image,
+      // always include boards and layerDataByBoardIndex
       text: JSON.stringify({ boards, layerDataByBoardIndex }, null, 2)
     }
     clipboard.clear()
     clipboard.write(payload)
-
-  } else {
-    //
-    //
-    // copy one board
-    //
-    saveImageFile() // ensure we have all layers created in the data and saved to disk
-
-    // copy a single board (the current board)
-    // if you have only one board in your selection, we copy the current board
-    //
-    // assumes that UI only allows a single selection when it is also the current board
-    //
-    let board = util.stringifyClone(boardData.boards[currentBoard])
-
-    let imageData = {}
-    imageData[LAYER_INDEX_MAIN] = storyboarderSketchPane.getLayerCanvasByName('main').toDataURL()
-
-    if (board.layers) {
-      for (let [layerName, sym] of [['reference', LAYER_INDEX_REFERENCE], ['notes', LAYER_INDEX_NOTES]]) { // HACK hardcoded
-        if (board.layers[layerName]) {
-          imageData[sym] = storyboarderSketchPane.getLayerCanvasByName(layerName).toDataURL()
-        }
-      }
-    }
-
-    let { width, height } = storyboarderSketchPane.sketchPane.getCanvasSize()
-    let size = [width, height]
-    // create transparent canvas, appropriately sized
-    let canvas = createSizedContext(size).canvas
-    exporterCommon.flattenBoardToCanvas(
-      board,
-      canvas,
-      size,
-      boardFilename
-    ).then(() => {
-      let payload = {
-        image: nativeImage.createFromDataURL(canvas.toDataURL()),
-        text: JSON.stringify({ boards: [board], layerDataByBoardIndex: [imageData] }, null, 2)
-      }
-      clipboard.clear()
-      clipboard.write(payload)
-      notifications.notify({ message: "Copied" })
-    }).catch(err => {
-      console.log(err)
-      notifications.notify({ message: "Error. Couldn't copy." })
-    })
+    console.log('Copied', boards.length, 'board(s) to clipboard')
+    // notifications.notify({ message: "Copied" })
+  } catch (err) {
+    console.log('Error. Could not copy.')
+    console.error(err)
+    notifications.notify({ message: 'Error. Couldn’t copy.' })
+    throw err
   }
 }
 
-let exportAnimatedGif = () => {
-  // load all the images in the selection
+const exportAnimatedGif = async () => {
+  console.log('main-window#exportAnimatedGif', selections)
   if (selections.has(currentBoard)) {
     saveImageFile()
   }
   let boards
-  if (selections.size == 1) {
+  if (selections.size === 1) {
+    // single value
     boards = util.stringifyClone(boardData.boards)
   } else {
-    boards = [...selections].sort(util.compareNumbers).map(n => util.stringifyClone(boardData.boards[n]))
+    // array of boards
+    boards = [...selections].sort(util.compareNumbers).map(
+      n => util.stringifyClone(boardData.boards[n])
+    )
   }
-  let boardSize = storyboarderSketchPane.sketchPane.getCanvasSize()
+  let boardSize = storyboarderSketchPane.getCanvasSize()
 
-  notifications.notify({message: "Exporting " + boards.length + " boards. Please wait...", timing: 5})
+  notifications.notify({
+    message: 'Exporting ' + boards.length + ' boards. Please wait...',
+    timing: 5
+  })
+
   sfx.down()
-  setTimeout(()=>{
-    exporter.exportAnimatedGif(boards, boardSize, 888, boardPath, true, boardData)
-  }, 1000)
+
+  try {
+    let path = await exporter.exportAnimatedGif(boards, boardSize, 888, boardFilename, true, boardData)
+    notifications.notify({
+      message: 'I exported your board selection as a GIF. Share it with your friends! Post it to your twitter thing or your slack dingus.',
+      timing: 20
+    })
+    sfx.positive()
+    shell.showItemInFolder(path)
+  } catch (err) {
+    console.error(err)
+    notifications.notify({ message: 'Could not export. An error occurred.' })
+    notifications.notify({ message: err.toString() })
+  }
 }
 
-exporter.on('complete', path => {
-  notifications.notify({message: "I exported your board selection as a GIF. Share it with your friends! Post it to your twitter thing or your slack dingus.", timing: 20})
-  sfx.positive()
-  shell.showItemInFolder(path)
-})
 
 const exportFcp = () => {
   notifications.notify({message: "Exporting " + boardData.boards.length + " boards to FCP and Premiere. Please wait...", timing: 5})
@@ -4544,98 +5344,89 @@ let pasteBoards = async () => {
   if (textInputMode) return
 
   // save the current image to disk
-  saveImageFile()
+  await saveImageFile()
 
-  let newBoards
-  let layerDataByBoardIndex
+  let pasted
 
-  // do we have JSON data?
+  // is paste a valid object from Storyboarder?
   let text = clipboard.readText()
   if (text !== "") {
     try {
-      let data = JSON.parse(text)
-
-      newBoards = data.boards
-      layerDataByBoardIndex = data.layerDataByBoardIndex
-
-      if (newBoards.length > 1) {
-        notifications.notify({ message: "Pasting " + newBoards.length + " boards.", timing: 5 })
-      } else {
-        notifications.notify({ message: "Pasting a board.", timing: 5 })
-      }
+      pasted = JSON.parse(clipboard.readText())
+      if (!pasted.boards.length || pasted.boards.length < 1) throw new Error('no boards')
+      if (!pasted.layerDataByBoardIndex.length || pasted.layerDataByBoardIndex.length < 1) throw new Error('no layer data')
     } catch (err) {
-      // if there is an error parsing the JSON
-      // ignore it, and continue on
-      // (it may be a valid single image instead)
-      // be sure to clear newBoards
+      console.log('could not parse clipboard as text')
       console.log(err)
-      newBoards = null
     }
   }
-  // ... otherwise ...
-  if (!newBoards) {
-    // ... do we have just image data?
+
+  // paste is probably from an external source
+  if (!pasted) {
+    // can we at least grab the image?
     let image = clipboard.readImage()
     if (!image.isEmpty()) {
-
-      // make a blank canvas placeholder for the main image
-      let { width, height } = storyboarderSketchPane.sketchPane.getCanvasSize()
-      let size = [width, height]
-      let blankCanvas = createSizedContext(size).canvas
-
-      // convert clipboard data to board object and layer data
-      newBoards = [
-        {
-          newShot: false,
-          url: 'imported.png', // placeholder filename
-          layers: {
-            reference: {
-              url: 'imported-reference.png' // placeholder filename
+      pasted = {
+        boards: [
+          // HACK trigger to construct a minimum board
+          {
+            layers: {
+              reference: {
+                url: null
+              }
             }
           }
-        }
-      ]
-      layerDataByBoardIndex = [{
-        [LAYER_INDEX_REFERENCE]: image.toDataURL(),
-        [LAYER_INDEX_MAIN]: blankCanvas.toDataURL()
-      }]
-
-      notifications.notify({ message: "Pasting a sweet image you probably copied from the internet, you dirty dog, you. It's on the reference layer, so feel free to draw over it. You can resize or reposition it." , timing: 10 })
+        ],
+        layerDataByBoardIndex: [
+          {
+            reference: image.toDataURL()
+          }
+        ]
+      }
+    } else {
+      console.log('could not read clipboard image')
     }
   }
 
-  if (newBoards) {
+  if (pasted && pasted.boards && pasted.boards.length) {
+    if (pasted.boards.length > 1) {
+      notifications.notify({ message: "Pasting " + pasted.boards.length + " boards.", timing: 5 })
+    } else {
+      notifications.notify({ message: "Pasting a board.", timing: 5 })
+    }
+
     let selectionsAsArray = [...selections].sort(util.compareNumbers)
-    let insertAt = selectionsAsArray[selectionsAsArray.length - 1] // insert after the right-most current selection
+
+    // insert after the right-most current selection
+    let insertAt = selectionsAsArray[selectionsAsArray.length - 1]
 
     insertAt = insertAt + 1 // actual splice point
 
-    // make a copy
-    let oldBoards = util.stringifyClone(newBoards)
-    // replace newBoards with a copy, migrated
-    newBoards = migrateBoards(newBoards, insertAt)
+    // old boards is a copy
+    let oldBoards = util.stringifyClone(pasted.boards)
 
-    //
-    //
+    // new boards is a copy, but migrated
+    let newBoards = migrateBoards(util.stringifyClone(pasted.boards), insertAt)
+
+    console.log('pasting boards from', oldBoards, 'to', newBoards)
+
     // insert boards from clipboard data
-    //
-    // store the "before" state
     try {
+      // store the "before" state
       storeUndoStateForScene(true)
-
-
 
       // copy linked boards
       newBoards.forEach((dst, n) => {
         let src = oldBoards[n]
-
+    
         // NOTE: audio is not copied
-
+    
         if (src.link) {
-
+          // TODO is link being migrated properly?
+          // see: https://github.com/wonderunit/storyboarder/issues/1165
           let from  = path.join(boardPath, 'images', src.link)
-          let to    = path.join(boardPath, 'images', dst.link)
-
+          let to    = path.join(boardPath, 'images', boardModel.boardFilenameForLink(dst))
+    
           if (fs.existsSync(from)) {
             console.log('copying linked PSD', from, 'to', to)
             fs.writeFileSync(to, fs.readFileSync(from))
@@ -4645,163 +5436,127 @@ let pasteBoards = async () => {
               timing: 8
             })
           }
-
+    
         }
       })
 
-
-
-      await insertBoards(boardData.boards, insertAt, newBoards, { layerDataByBoardIndex })
+      await insertBoards(
+        boardData.boards,
+        insertAt,
+        newBoards,
+        {
+          layerDataByBoardIndex: pasted.layerDataByBoardIndex
+        }
+      )
 
       markBoardFileDirty()
       storeUndoStateForScene()
 
       renderThumbnailDrawer()
 
-
       console.log('paste complete')
+      notifications.notify({ message: `Paste complete.` })
       sfx.positive()
-      return gotoBoard(insertAt)
+      await gotoBoard(insertAt)
 
     } catch (err) {
+      console.error(err)
+      console.log(error.stack)
+      console.log(new Error().stack)
       notifications.notify({ message: `Whoops. Could not paste boards. ${err.message}`, timing: 8 })
-      console.log(err)
+      throw err
     }
-
   } else {
     notifications.notify({ message: "There's nothing in the clipboard that I can paste. Are you sure you copied it right?", timing: 8 })
     sfx.error()
+    throw new Error('empty clipboard')
+  }  
+}
+
+const insertBoards = async (dest, insertAt, boards, { layerDataByBoardIndex }) => {
+  let size = [
+    storyboarderSketchPane.sketchPane.width,
+    storyboarderSketchPane.sketchPane.height
+  ]
+
+  for (let index = 0; index < boards.length; index++) {
+    let board = boards[index]
+
+    // for each board
+    let position = insertAt + index
+    let imageData = layerDataByBoardIndex[index]
+
+    // scale layer images and save to files
+    if (imageData) {
+      for (let [name, image] of Object.entries(imageData)) {
+        // if this is a valid layer
+        if (storyboarderSketchPane.sketchPane.layers.findByName(name)) {
+          // scale the image
+          let scaledImageData = await fitImageData(size, image)
+          // save it to a file
+          saveDataURLtoFile(scaledImageData, board.layers[name].url)
+        }
+      }
+    }
+
+    // add to the data
+    dest.splice(position, 0, board)
+
+    // save the posterframe
+    // either from SketchPane in memory, or from the filesystem
+    await savePosterFrame(board, position !== currentBoard)
+
+    // update the thumbnail
+    await saveThumbnailFile(position, { forceReadFromFiles: true })
   }
 }
 
-const insertBoards = (dest, insertAt, boards, { layerDataByBoardIndex }) => {
-  // TODO pass `size` as argument instead of relying on storyboarderSketchPane
-  let { width, height } = storyboarderSketchPane.sketchPane.getCanvasSize()
-  let size = [width, height]
+const fitImageData = async (boardSize, imageData) => {
+  let image = await exporterCommon.getImage(imageData)
 
-  return new Promise((resolve, reject) => {
-    let tasks = Promise.resolve()
-    boards.forEach((board, index) => {
-      // for each board
-      let position = insertAt + index
-      let imageData = layerDataByBoardIndex[index]
-
-      // scale layer images and save to files
-      if (imageData) {
-
-        if (imageData[LAYER_INDEX_MAIN]) {
-          tasks = tasks.then(() =>
-            fitImageData(size, imageData[LAYER_INDEX_MAIN]).then(scaledImageData =>
-              saveDataURLtoFile(scaledImageData, board.url)))
-        }
-
-        if (imageData[LAYER_INDEX_REFERENCE]) {
-          tasks = tasks.then(() =>
-            fitImageData(size, imageData[LAYER_INDEX_REFERENCE]).then(scaledImageData =>
-              saveDataURLtoFile(scaledImageData, board.layers.reference.url)))
-        }
-
-        if (imageData[LAYER_INDEX_NOTES]) {
-          tasks = tasks.then(() =>
-            fitImageData(size, imageData[LAYER_INDEX_NOTES]).then(scaledImageData =>
-              saveDataURLtoFile(scaledImageData, board.layers.notes.url)))
-        }
-      }
-
-      tasks = tasks.then(() => {
-        // add to the data
-        dest.splice(position, 0, board)
-
-        // update the thumbnail
-        return saveThumbnailFile(position, { forceReadFromFiles: true })
-      })
-    })
-
-    tasks.then(() => {
-      resolve()
-    }).catch(err => {
-      console.log(err)
-      reject(err)
-    })
-  })
+  // if ratio matches,
+  // don't bother drawing,
+  // just return original image data
+  if (
+    image.width === boardSize[0] &&
+    image.height === boardSize[1]
+  ) {
+    return imageData
+  } else {
+    let context = createSizedContext(boardSize)
+    let canvas = context.canvas
+    context.drawImage(image, ...util.fitToDst(canvas, image).map(Math.round))
+    return canvas.toDataURL()
+  }
 }
-
-// via https://stackoverflow.com/questions/6565703/math-algorithm-fit-image-to-screen-retain-aspect-ratio
-//
-// Image data: (wi, hi) and define ri = wi / hi
-// Screen resolution: (ws, hs) and define rs = ws / hs
-//
-// rs > ri ? (wi * hs/hi, hs) : (ws, hi * ws/wi)
-//
-// top = (hs - hnew)/2
-// left = (ws - wnew)/2
-
-const fitToDst = (dst, src) => {
-  let wi = src.width
-  let hi = src.height
-  let ri = wi / hi
-
-  let ws = dst.width
-  let hs = dst.height
-  let rs = ws / hs
-
-  let [wnew, hnew] = rs > ri ? [wi * hs/hi, hs] : [ws, hi * ws/wi]
-
-  let x = (ws - wnew)/2
-  let y = (hs - hnew)/2
-
-  return [x, y, wnew, hnew]
-}
-
-const fitImageData = (boardSize, imageData) => {
-  return new Promise((resolve, reject) => {
-    exporterCommon.getImage(imageData).then(image => {
-      // if ratio matches,
-      // don't bother drawing,
-      // just return original image data
-      if (
-        image.width  == boardSize[0] &&
-        image.height == boardSize[1]
-      ) {
-        resolve(imageData)
-      } else {
-        let context = createSizedContext(boardSize)
-        let canvas = context.canvas
-        context.drawImage(image, ...fitToDst(canvas, image).map(Math.round))
-        resolve(canvas.toDataURL())
-      }
-    }).catch(err => {
-      console.log(err)
-      reject(err)
-    })
-  })
-}
-
 
 const importFromWorksheet = async (imageArray) => {
   let insertAt = 0 // pos
   let boards = []
 
-  for (var i = 0; i < imageArray.length; i++) {
+  // related: insertNewBoardDataAtPosition, migrateBoards
+  for (let i = 0; i < imageArray.length; i++) {
     let board = {}
     let uid = util.uidGen(5)
     board.uid = uid
-    board.url = 'board-' + (insertAt+i) + '-' + board.uid + '.png'
-    board.layers = {reference: {url: board.url.replace('.png', '-reference.png')}}
+    board.url = 'board-' + (insertAt + i) + '-' + board.uid + '.png'
+    board.layers = {
+      reference: {
+        url: board.url.replace('.png', '-reference.png')
+      }
+    }
     board.newShot = false
     board.lastEdited = Date.now()
 
     boards.push(board)
   }
 
-  let blankCanvas = document.createElement('canvas').toDataURL()
-
   let layerDataByBoardIndex = []
-  for (var i = 0; i < imageArray.length; i++) {
-    let board = {}
-    board[0] = imageArray[i]
-    board[1] = blankCanvas
-    layerDataByBoardIndex.push(board)
+  for (let i = 0; i < imageArray.length; i++) {
+    let layerData = {}
+    layerDataByBoardIndex.push({
+      reference: imageArray[i]
+    })
   }
 
   //
@@ -4826,7 +5581,7 @@ const importFromWorksheet = async (imageArray) => {
     notifications.notify({ message: 'Worksheet Import complete.', timing: 5 })
     return gotoBoard(insertAt)
   } catch (err) {
-    notifications.notify({ message: "Whoops. Could not import.", timing: 8 })
+    notifications.notify({ message: 'Whoops. Could not import.', timing: 8 })
     console.log(err)
   }
 }
@@ -5123,38 +5878,38 @@ const runRandomizedNotifications = (messages) => {
 
 const getSceneNumberBySceneId = (sceneId) => {
   if (!scriptData) return null
-  let orderedScenes = scriptData.filter(data => data.type == 'scene')
-  return orderedScenes.findIndex(scene => scene.scene_id == sceneId)
+  let orderedScenes = scriptData.filter(data => data.type === 'scene')
+  return orderedScenes.findIndex(scene => scene.scene_id === sceneId)
 }
 
 // returns the scene object (if available) or null
 const getSceneObjectByIndex = (index) =>
-  scriptData && scriptData.find(data => data.type == 'scene' && data.scene_number == index + 1)
+  scriptData && scriptData.find(data => data.type === 'scene' && data.scene_number === index + 1)
 
 const storeUndoStateForScene = (isBefore) => {
-  let scene = getSceneObjectByIndex(currentScene) 
+  let scene = getSceneObjectByIndex(currentScene)
   // sceneId is allowed to be null (for a single storyboard with no script)
   let sceneId = scene && scene.scene_id
-  undoStack.addSceneData(isBefore, { sceneId : sceneId, boardData: util.stringifyClone(boardData) })
+  undoStack.addSceneData(isBefore, { sceneId: sceneId, boardData: util.stringifyClone(boardData) })
 }
-const applyUndoStateForScene = (state) => {
-  if (state.type != 'scene') return // only `scene`s for now
+const applyUndoStateForScene = async (state) => {
+  await saveImageFile() // needed for redo
+  if (state.type !== 'scene') return // only `scene`s for now
 
   let currSceneObj = getSceneObjectByIndex(currentScene)
-  if (currSceneObj && currSceneObj.scene_id != state.sceneId) {
+  if (currSceneObj && currSceneObj.scene_id !== state.sceneId) {
     // go to that scene
     saveBoardFile()
     currentScene = getSceneNumberBySceneId(state.sceneId)
-    loadScene(currentScene).then(() => {
-      verifyScene()
-      renderScript()
-    })
+    await loadScene(currentScene)
+    // migrateScene() // not required here
+    verifyScene()
+    renderScript()
   }
   boardData = state.sceneData
   renderScene()
 }
 
-// TODO memory management. dispose unused canvases
 const storeUndoStateForImage = (isBefore, layerIndices = null) => {
   let scene = getSceneObjectByIndex(currentScene)
   let sceneId = scene && scene.scene_id
@@ -5162,11 +5917,9 @@ const storeUndoStateForImage = (isBefore, layerIndices = null) => {
   if (!layerIndices) layerIndices = [storyboarderSketchPane.sketchPane.getCurrentLayerIndex()]
 
   let layers = layerIndices.map(index => {
-    // backup to an offscreen canvas
-    let source = storyboarderSketchPane.getSnapshotAsCanvas(index)
     return {
       index,
-      source
+      source: storyboarderSketchPane.getUndoStateForLayer(index)
     }
   })
 
@@ -5178,49 +5931,36 @@ const storeUndoStateForImage = (isBefore, layerIndices = null) => {
   })
 }
 
-const applyUndoStateForImage = (state) => {
+const applyUndoStateForImage = async (state) => {
   // if required, go to the scene first
   let currSceneObj = getSceneObjectByIndex(currentScene)
-  if (currSceneObj && currSceneObj.scene_id != state.sceneId) {
-    saveImageFile()
+  if (currSceneObj && currSceneObj.scene_id !== state.sceneId) {
+    await saveImageFile()
     // go to the requested scene
     currentScene = getSceneNumberBySceneId(state.sceneId)
-    loadScene(currentScene).then(() => {
-      verifyScene()
-      renderScript()
-    })
+    await loadScene(currentScene)
+    // migrateScene() // not required here
+    verifyScene()
+    renderScript()
   }
-
-  let sequence = Promise.resolve()
-
-  // wait until save completes
-  sequence = sequence.then(() => saveImageFile())
 
   // if required, go to the board first
-  if (currentBoard != state.boardIndex) {
-    sequence = sequence.then(() => gotoBoard(state.boardIndex))
+  if (currentBoard !== state.boardIndex) {
+    await saveImageFile()
+    await gotoBoard(state.boardIndex)
   }
 
-  sequence = sequence.then(() => {
-    for (let layerData of state.layers) {
-      // get the context of the undo-able layer
-      let context = storyboarderSketchPane.sketchPane.getLayerCanvas(layerData.index).getContext('2d')
+  // uncomment to force save on undo/redo
+  // await saveImageFile()
 
-      // draw saved canvas onto layer
-      context.save()
-      context.globalAlpha = 1
-      context.clearRect(0, 0, context.canvas.width, context.canvas.height)
-      context.drawImage(layerData.source, 0, 0)
-      context.restore()
+  for (let layerData of state.layers) {
+    storyboarderSketchPane.applyUndoStateForLayer(layerData)
+    markImageFileDirty([layerData.index])
+  }
 
-      markImageFileDirty([layerData.index])
-    }
-
-  })
-  .then(() => saveThumbnailFile(state.boardIndex))
-  .then(index => updateThumbnailDisplayFromFile(index))
-  .then(() => toolbar.emit('cancelTransform'))
-  .catch(e => console.error(e))
+  // uncomment to force save on undo/redo
+  // let index = await saveThumbnailFile(state.boardIndex)
+  // await updateThumbnailDisplayFromFile(index)
 }
 
 const createSizedContext = size => {
@@ -5247,7 +5987,7 @@ const saveAsFolder = async () => {
 
   // display the file selection window
   let dstFolderPath = remote.dialog.showSaveDialog(null, {
-    defaultPath: path.basename(srcFilePath, path.extname(srcFilePath))
+    defaultPath: app.getPath('documents')
   })
 
   // user cancelled
@@ -5299,6 +6039,76 @@ const saveAsFolder = async () => {
       type: 'error',
       message: error.message
     })
+  }
+}
+
+const exportWeb = async () => {
+  if (!prefsModule.getPrefs().auth) {
+    showSignInWindow()
+  } else {
+    await startWebUpload()
+  }
+}
+const showSignInWindow = () => {
+  if (exportWebWindow) {
+    exportWebWindow.destroy()
+  }
+
+  textInputMode = true
+  textInputAllowAdvance = false
+
+  exportWebWindow = new remote.BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 600,
+    minHeight: 600,
+    backgroundColor: '#333333',
+    show: false,
+    center: true,
+    parent: remote.getCurrentWindow(),
+    resizable: true,
+    frame: false,
+    modal: true
+  })
+  exportWebWindow.loadURL(`file://${__dirname}/../../upload.html`)
+  exportWebWindow.once('ready-to-show', () => {
+    exportWebWindow.show()
+  })
+  exportWebWindow.on('hide', () => {
+    ipcRenderer.send('textInputMode', false)
+  })
+}
+ipcRenderer.on('signInSuccess', (event, response) => {
+  notifications.notify({ message: 'Success! You’re Signed In!' })
+
+  prefsModule.set('auth', { token: response.token })
+
+  exportWeb()
+})
+const startWebUpload = async () => {
+  // ensure the current board and data is saved
+  await saveImageFile()
+  saveBoardFile()
+
+  notifications.notify({ message: 'Uploading to Storyboarders.com. This might take a while …' })
+
+  // let the notification appear
+  await new Promise(resolve => setTimeout(resolve, 1000))
+
+  try {
+    let result = await exporterWeb.uploadToWeb(boardFilename)
+    notifications.notify({ message: 'Upload complete!' })
+    console.log('Uploaded to', result.link)
+    remote.shell.openExternal(result.link)
+  } catch (err) {
+    if (err.name === 'StatusCodeError' && err.statusCode === 403) {
+      notifications.notify({ message: 'Oops! Your credentials are invalid or have expired. Please try signing in again to upload.' })
+      prefsModule.set('auth', undefined)
+      showSignInWindow()
+    } else {
+      console.error(err)
+      notifications.notify({ message: 'Whoops! An error occurred while attempting to upload.' })
+    }
   }
 }
 
@@ -5379,41 +6189,20 @@ class TimelineModeControlView {
   }
 }
 
-ipcRenderer.on('setTool', (e, arg)=> {
-  if (!toolbar) return
-
+ipcRenderer.on('setTool', (e, toolName) => {
   if (!textInputMode && !storyboarderSketchPane.getIsDrawingOrStabilizing()) {
-    console.log('setTool', arg)
-    switch(arg) {
-      case 'lightPencil':
-        toolbar.setState({ brush: 'light-pencil' })
-        break
-      case 'pencil':
-        toolbar.setState({ brush: 'pencil' })
-        break
-      case 'pen':
-        toolbar.setState({ brush: 'pen' })
-        break
-      case 'brush':
-        toolbar.setState({ brush: 'brush' })
-        break
-      case 'notePen':
-        toolbar.setState({ brush: 'note-pen' })
-        break
-      case 'eraser':
-        toolbar.setState({ brush: 'eraser' })
-        break
-    }
+    store.dispatch({ type: 'TOOLBAR_TOOL_CHANGE', payload: toolName, meta: { scope: 'local' } })
   }
 })
 
-ipcRenderer.on('useColor', (e, arg)=> {
-  if (!toolbar) return
-
+ipcRenderer.on('useColor', (e, arg) => {
   if (!textInputMode) {
-    if (toolbar.getCurrentPalette()) {
-      toolbar.emit('current-set-color', toolbar.getCurrentPalette()[arg-1])
-    }
+    // set the color of the current tool to be the given palette index
+    const state = store.getState()
+    const color = state.toolbar.tools[state.toolbar.activeTool].palette[arg - 1]
+    store.dispatch({ type: 'TOOLBAR_TOOL_SET', payload: { color } })
+    colorPicker.setState({ color: Color(color).toCSS() })
+    sfx.playEffect('metal')
   }
 })
 
@@ -5428,45 +6217,16 @@ ipcRenderer.on('clear', (e, arg) => {
 ipcRenderer.on('brushSize', (e, direction) => {
   if (!textInputMode) {
     if (direction > 0) {
-      toolbar.changeBrushSize(1)
+      store.dispatch({ type: 'TOOLBAR_BRUSH_SIZE_INC' })
+      // store.dispatch({ type: 'PLAY_SOUND', payload: 'brush-size-up' }) // TODO
       sfx.playEffect('brush-size-up')
     } else {
-      toolbar.changeBrushSize(-1)
+      store.dispatch({ type: 'TOOLBAR_BRUSH_SIZE_DEC' })
+      // store.dispatch({ type: 'PLAY_SOUND', payload: 'brush-size-down' }) // TODO
       sfx.playEffect('brush-size-down')
     }
   }
 })
-// TODO move this code into the toolbar
-// HACK to support changing eraser size during quick erase
-window.addEventListener('keydown', e => {
-  if (!toolbar) return
-
-  // when alt key is held down during Quick Erase mode,
-  // menu won't trigger the '[' and ']' accelerators
-  // so we need to detect the combination
-  // and call changeBrushSize ourselves
-  const changeEraserSizeDuringQuickErase = direction => {
-    // remember the actual brush we're on
-    let prior = toolbar.state.brush
-    // switch to eraser long enough to change the brush size
-    toolbar.state.brush = 'eraser'
-    // change the brush size, which will re-render the cursor
-    toolbar.changeBrushSize(direction)
-    // re-render the toolbar to reflect prior brush
-    toolbar.state.brush = prior
-    toolbar.render()
-  }
-  if (toolbar.getIsQuickErasing()) {
-    if (isCommandPressed('drawing:quick-erase-size:inc')) {
-      changeEraserSizeDuringQuickErase(1)
-      sfx.playEffect('brush-size-up')
-    } else if (isCommandPressed('drawing:quick-erase-size:dec')) {
-      changeEraserSizeDuringQuickErase(-1)
-      sfx.playEffect('brush-size-down')
-    }
-  }
-})
-
 
 ipcRenderer.on('flipBoard', (e, arg)=> {
   if (storyboarderSketchPane.preventIfLocked()) return
@@ -5480,7 +6240,14 @@ ipcRenderer.on('flipBoard', (e, arg)=> {
 
 ipcRenderer.on('deleteBoards', (event, args)=>{
   if (!textInputMode) {
-    deleteBoards(args)
+    let numDeleted = deleteBoards(args)
+    if (numDeleted > 0) {
+      let noun = `board${numDeleted > 1 ? 's' : ''}`
+      notifications.notify({
+        message: `Deleted ${numDeleted} ${noun}.`,
+        timing: 5
+      })
+    }
   }
 })
 
@@ -5515,7 +6282,8 @@ ipcRenderer.on('cycleViewMode', (event, args)=>{
 
 ipcRenderer.on('toggleCaptions', (event, args)=>{
   if (!textInputMode) {
-    toggleCaptions()
+    store.dispatch({ type: 'TOOLBAR_CAPTIONS_TOGGLE' })
+    sfx.playEffect('metal')
   }
 })
 
@@ -5534,15 +6302,25 @@ ipcRenderer.on('insertNewBoardsWithFiles', (event, filepaths)=> {
   insertNewBoardsWithFiles(filepaths)
 })
 
-ipcRenderer.on('importImage', (event, args)=> {
-  //console.log(args)
-  importImage(args)
+ipcRenderer.on('importImage', (event, fileData) => {
+  // console.log('mobile image import fileData:', fileData)
+  importImage(fileData)
 })
 
-ipcRenderer.on('toggleGuide', (event, args) => {
+ipcRenderer.on('toggleGuide', (event, arg) => {
+  console.log('toggleGuide', arg)
   if (!textInputMode) {
-    toolbar.setState({ [args]: !toolbar.state[args] })
-    toolbar.emit(args, toolbar.state[args])
+    store.dispatch({ type: 'TOOLBAR_GUIDE_TOGGLE', payload: arg })
+    // this.store.dispatch({ type: 'PLAY_SOUND', payload: 'metal' }) // TODO
+    sfx.playEffect('metal')
+  }
+})
+
+ipcRenderer.on('toggleOnionSkin', (event, arg) => {
+  if (!textInputMode) {
+    store.dispatch({ type: 'TOOLBAR_ONION_TOGGLE' })
+    // this.store.dispatch({ type: 'PLAY_SOUND', payload: 'metal' }) // TODO
+    sfx.playEffect('metal')
   }
 })
 
@@ -5673,6 +6451,7 @@ ipcRenderer.on('importNotification', (event, args) => {
   let hostname = os.hostname()
   let that = this
   dns.lookup(hostname, function (err, add, fam) {
+    add = add != null ? add : hostname
     let message =  "Did you know that you can import directly from your phone?\n\nOn your mobile phone, go to the web browser and type in: \n\n" + add + ":1888"
     notifications.notify({message: message, timing: 60})
   })
@@ -5713,6 +6492,8 @@ ipcRenderer.on('save', (event, args) => {
 
 ipcRenderer.on('saveAs', (event, args) => saveAsFolder())
 
+ipcRenderer.on('exportWeb', (event, args) => exportWeb())
+
 ipcRenderer.on('exportZIP', (event, args) => exportZIP())
 
 ipcRenderer.on('reloadScript', (event, args) => reloadScript(args))
@@ -5746,11 +6527,65 @@ ipcRenderer.on('toggleAudition', value => {
   audioPlayback.toggleAudition()
 })
 
+ipcRenderer.on('revealShotGenerator', value => {
+  document.querySelector('#shot-generator-container').scrollIntoView({
+    behavior: 'smooth'
+  })
+})
+
+const ZOOM_LEVELS = [
+  .25,
+  .33,
+  .50,
+  .60,
+  1.00,
+  2.00,
+  3.00,
+  4.00,
+  5.00,
+  6.00,
+  7.00,
+  8.00
+]
+const ZOOM_CENTER = 4
+let zoomIndex = ZOOM_CENTER
+// via https://stackoverflow.com/a/25087661
+const closest = (arr, target) => {
+   for (let i = 1; i < arr.length; i++) {
+    // found larger
+    if (arr[i] > target) {
+      let p = arr[i - 1]
+      let c = arr[i]
+      // return closest of prev and curr
+      return Math.abs( p - target ) < Math.abs( c - target ) ? p : c
+    }
+  }
+  // none larger
+  return arr[arr.length - 1]
+}
+ipcRenderer.on('zoomReset', value => {
+  zoomIndex = ZOOM_CENTER
+  storyboarderSketchPane.zoomCenter(ZOOM_LEVELS[zoomIndex])
+})
+ipcRenderer.on('zoomIn', value => {
+  let zoomIndex = ZOOM_LEVELS.indexOf(closest(ZOOM_LEVELS, storyboarderSketchPane.sketchPane.zoom))
+  zoomIndex = Math.min(ZOOM_LEVELS.length - 1, zoomIndex + 1)
+  storyboarderSketchPane.zoomAtCursor(ZOOM_LEVELS[zoomIndex])
+})
+ipcRenderer.on('zoomOut', value => {
+  let zoomIndex = ZOOM_LEVELS.indexOf(closest(ZOOM_LEVELS, storyboarderSketchPane.sketchPane.zoom))
+  zoomIndex = Math.max(0, zoomIndex - 1)
+  storyboarderSketchPane.zoomAtCursor(ZOOM_LEVELS[zoomIndex])
+})
+
 const log = opt => ipcRenderer.send('log', opt)
 
-// HACK to support Cmd+R reloading
+if (prefsModule.getPrefs().enableDiagnostics) {
+  new DiagnosticsView()
+}
+
 if (isDev) {
-  // wait
+  // HACK to support Cmd+R reloading
   setTimeout(() => {
     // … if no boardData present after timeout, we probably just Cmd+R reloaded
     if (!boardData) {
@@ -5768,5 +6603,5 @@ if (isDev) {
         ])
       }
     }
-  }, 500)
+  }, 1500)
 }

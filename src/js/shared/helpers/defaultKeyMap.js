@@ -8,6 +8,7 @@ const defaultKeyMap = {
   "drawing:move-mode": "CommandOrControl",
   "drawing:quick-erase-modifier": "Alt",
   "drawing:exit-current-mode": "Escape",
+  "drawing:pan-mode": "Shift",
 
   "menu:file:open": "CommandOrControl+o",
   "menu:file:save": "CommandOrControl+s",
@@ -44,11 +45,12 @@ const defaultKeyMap = {
   "menu:boards:add-audio-file": 'a',
 
   "menu:tools:light-pencil": "1",
-  "menu:tools:pencil": "2",
-  "menu:tools:pen": "3",
-  "menu:tools:brush": "4",
-  "menu:tools:note-pen": "5",
-  "menu:tools:eraser": "6",
+  "menu:tools:brush": "2",
+  "menu:tools:tone": "3",
+  "menu:tools:pencil": "4",
+  "menu:tools:pen": "5",
+  "menu:tools:note-pen": "6",
+  "menu:tools:eraser": "7",
   "menu:tools:clear-all-layers": "Backspace",
   "menu:tools:clear-layer": "Alt+Backspace",
   "menu:tools:palette-color-1": "8",
@@ -64,6 +66,10 @@ const defaultKeyMap = {
   "menu:view:toggle-timeline": "CommandOrControl+Option+t",
   "menu:view:toggle-full-screen": "F11",
   "menu:view:toggle-developer-tools": "Alt+Command+i",
+
+  "menu:view:zoom-reset": "CommandOrControl+0",
+  "menu:view:zoom-in": "CommandOrControl+Plus",
+  "menu:view:zoom-out": "CommandOrControl+-",
 
   "menu:window:minimize": "CommandOrControl+m",
   "menu:window:close": "CommandOrControl+w",

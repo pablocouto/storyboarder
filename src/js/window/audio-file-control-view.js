@@ -38,8 +38,11 @@ class AudioFileControlView {
       for (let entry of entries) {
         if (entry.target === recordVisualization) {
           // re-size
-          context.canvas.width = entry.contentRect.width
-          context.canvas.height = entry.contentRect.height
+
+          // see: https://github.com/wonderunit/storyboarder/issues/1218
+          context.canvas.width = entry.target.offsetWidth
+          context.canvas.height = entry.target.offsetHeight
+
           // trigger a re-render
           this.setState(this.state)
         }
@@ -65,13 +68,13 @@ class AudioFileControlView {
     // prevent during countdown and finalizing
     if (event.type === 'click' && this.state.mode === 'stopped') {
       this.recordButtonEl.removeEventListener('click', this.onRecordMouseEvent)
-      this.recordButtonEl.addEventListener('mousedown', this.onRecordMouseEvent)
+      this.recordButtonEl.addEventListener('pointerdown', this.onRecordMouseEvent)
       this.onStartRecord(event)
     }
 
     // prevent during countdown and finalizing
-    if (event.type === 'mousedown' && this.state.mode === 'recording') {
-      this.recordButtonEl.removeEventListener('mousedown', this.onRecordMouseEvent)
+    if (event.type === 'pointerdown' && this.state.mode === 'recording') {
+      this.recordButtonEl.removeEventListener('pointerdown', this.onRecordMouseEvent)
       this.onStopRecord(event)
 
       // wait for the next `click` ...
@@ -283,6 +286,27 @@ const WavEncoder = require("wav-encoder")
 // states: initializing, stopped, recording, finalizing
 class Recorder {
   async initialize () {
+    // FOR TROUBLESHOOTING AUDIO ISSUES
+    // list out the audio devices to the console
+    // throw a more helpful error if 'default' audio device cannot be found
+    // NOTE inefficient, as `Tone.UserMedia.enumerateDevices` is also called again later by userMedia.open
+    let devices = await Tone.UserMedia.enumerateDevices()
+    console.log(`Tone.UserMedia found ${devices.length} audio devices:`)
+    devices.forEach(d => 
+      console.log(
+        '-',
+        `${d.label} [${d.deviceId.length && d.deviceId.slice(0, 7)}]`,
+        'kind:', d.kind,
+        'groupId:', (d.groupId.length && d.groupId.slice(0, 7)),
+        d
+      )
+    )
+    if (!devices.find(d => d.deviceId === 'default')) {
+      throw new Error(
+        'Could not find default audio device in the list of available devices:\n' +
+        devices.map(d => `- ${d.label} [${d.deviceId.length && d.deviceId.slice(0, 7)}]`).join('\n'))
+    }
+
     this.userMedia = new Tone.UserMedia()
     this.analyser = new Tone.Analyser({ type: 'waveform', size: 1024 })
     this.meter = new Tone.Meter()

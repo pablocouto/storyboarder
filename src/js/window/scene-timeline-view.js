@@ -166,7 +166,8 @@ class ScaleControlView {
     this.ro = new window.ResizeObserver(entries => {
       for (let entry of entries) {
         if (entry.target === this.refs.container) {
-          this.onElementResize(entry.contentRect, true)
+          // see: https://github.com/wonderunit/storyboarder/issues/1218
+          this.onElementResize({ width: entry.target.offsetWidth }, true)
         }
       }
     })
@@ -667,6 +668,9 @@ class TimelineView {
   // the component's associated DOM element. Babel is instructed to call the
   // `etch.dom` helper in compiled JSX expressions by the `@jsx` pragma.
   render () {
+
+    //console.log("RENDER IS BEING CALLED EVERY MOUSE UP. WTFFFFFF.")
+
     let boardsViews = this.scene.boards.map((board, index) =>
         etch.dom(BoardView, {
           pixelsPerMsec: this.pixelsPerMsec,
@@ -691,23 +695,26 @@ class TimelineView {
       let duration = boardModel.boardDuration(this.scene, board)
 
       if (board.audio) {
-        let buffer = this.getAudioBufferByFilename(board.audio.filename)
+          let buffer = this.getAudioBufferByFilename(board.audio.filename)
 
-        let audioDurationInMsecs = Math.round(buffer.duration * 1000)
+          if (buffer) {
+          let audioDurationInMsecs = Math.round(buffer.duration * 1000)
 
-        let currLane = lanes.length
-        for (let i = 0; i < lanes.length; i++) {
-          let time = lanes[i].endInMsecs
-          if (timelinePosInMsecs >= time) {
-            currLane = i
-            break
+          let currLane = lanes.length
+          for (let i = 0; i < lanes.length; i++) {
+            let time = lanes[i].endInMsecs
+            if (timelinePosInMsecs >= time) {
+              currLane = i
+              break
+            }
           }
-        }
-        lanes[currLane] = lanes[currLane] || { boards: [], endInMsecs: 0 }
-        lanes[currLane].boards.push(board)
-        lanes[currLane].endInMsecs = timelinePosInMsecs + audioDurationInMsecs
+          lanes[currLane] = lanes[currLane] || { boards: [], endInMsecs: 0 }
+          lanes[currLane].boards.push(board)
+          lanes[currLane].endInMsecs = timelinePosInMsecs + audioDurationInMsecs
 
-        timelinePosInMsecs += duration
+          timelinePosInMsecs += duration
+        }
+
       }
     }
 
@@ -847,7 +854,8 @@ class TimelineView {
     this.ro = new window.ResizeObserver(entries => {
       for (let entry of entries) {
         if (entry.target === this.element) {
-          this.onElementResize(entry.contentRect, true)
+          // see: https://github.com/wonderunit/storyboarder/issues/1218
+          this.onElementResize({ width: entry.target.offsetWidth }, true)
         }
       }
     })

@@ -113,6 +113,12 @@ AppMenu.File = () => ({
       }
     },
     {
+      label: 'Export to Web …',
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('exportWeb')
+      }
+    },
+    {
       label: 'Export Project as ZIP',
       click (item, focusedWindow, event) {
         ipcRenderer.send('exportZIP')
@@ -400,7 +406,21 @@ AppMenu.Tools = () => ({
       accelerator: keystrokeFor('menu:tools:light-pencil'),
       label: 'Light Pencil',
       click (item, focusedWindow, event) {
-        ipcRenderer.send('setTool', 'lightPencil')
+        ipcRenderer.send('setTool', 'light-pencil')
+      }
+    },
+    {
+      accelerator: keystrokeFor('menu:tools:brush'),
+      label: 'Brush',
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('setTool', 'brush')
+      }
+    },
+    {
+      accelerator: keystrokeFor('menu:tools:tone'),
+      label: 'Tone',
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('setTool', 'tone')
       }
     },
     {
@@ -418,17 +438,10 @@ AppMenu.Tools = () => ({
       }
     },
     {
-      accelerator: keystrokeFor('menu:tools:brush'),
-      label: 'Brush',
-      click (item, focusedWindow, event) {
-        ipcRenderer.send('setTool', 'brush')
-      }
-    },
-    {
       accelerator: keystrokeFor('menu:tools:note-pen'),
       label: 'Note Pen',
       click (item, focusedWindow, event) {
-        ipcRenderer.send('setTool', 'notePen')
+        ipcRenderer.send('setTool', 'note-pen')
       }
     },
     {
@@ -516,6 +529,12 @@ AppMenu.Tools = () => ({
       type: 'separator'
     },
     {
+      label: 'Shot Generator',
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('revealShotGenerator')
+      }
+    },
+    {
       label: 'Edit in Photoshop',
       accelerator: keystrokeFor('menu:tools:edit-in-photoshop'),
       click (item, focusedWindow, event) {
@@ -574,7 +593,7 @@ AppMenu.View = () => ({
       label: 'Toggle Onion Skin',
       accelerator: keystrokeFor('menu:view:onion-skin'),
       click (item, focusedWindow, event) {
-        ipcRenderer.send('toggleGuide', 'onion')
+        ipcRenderer.send('toggleOnionSkin')
       }
     },
     {
@@ -604,6 +623,27 @@ AppMenu.View = () => ({
     {
       accelerator: keystrokeFor("menu:view:toggle-full-screen"),
       role: 'togglefullscreen'
+    },
+    {
+      label: 'Actual Size',
+      accelerator: keystrokeFor("menu:view:zoom-reset"),
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('zoomReset')
+      }
+    },
+    {
+      label: 'Zoom In',
+      accelerator: keystrokeFor("menu:view:zoom-in"),
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('zoomIn')
+      }
+    },
+    {
+      label: 'Zoom Out',
+      accelerator: keystrokeFor("menu:view:zoom-out"),
+      click (item, focusedWindow, event) {
+        ipcRenderer.send('zoomOut')
+      }
     }
   ]
 })

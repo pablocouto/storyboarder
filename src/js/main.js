@@ -74,6 +74,9 @@ let isLoadingProject
 
 let appServer
 
+// attempt to support older GPUs
+app.commandLine.appendSwitch('ignore-gpu-blacklist')
+
 // this only works on mac.
 app.on('open-file', (event, path) => {
   event.preventDefault()
@@ -91,28 +94,71 @@ app.on('ready', async () => {
   let ffmpegVersion = await exporterFfmpeg.checkVersion()
   console.log('ffmpeg version', ffmpegVersion)
 
-  // try to load key map
+
+
+  // load key map
   const keymapPath = path.join(app.getPath('userData'), 'keymap.json')
-  // ensure keymap.json exists
-  if (!fs.existsSync(keymapPath)) {
-    console.log('Creating', keymapPath)
-    fs.writeFileSync(keymapPath, JSON.stringify(defaultKeyMap, null, 2) + '\n')
-  }
-  // attempt to merge it in with defaults
-  try {
+  let payload = {}
+  let shouldOverwrite = false
+
+  if (fs.existsSync(keymapPath)) {
     console.log('Reading', keymapPath)
-    store.dispatch({
-      type: 'SET_KEYMAP',
-      payload: JSON.parse(fs.readFileSync(keymapPath, { encoding: 'utf8' }))
-    })
-  } catch (err) {
-    console.error(err)
-    dialog.showMessageBox({
-      type: 'error',
-      message: `Whoops! An error ocurred while trying to read keymap.json.
-                Using default keymap instead.\n\n${err}`
-    })
+    try {
+      payload = JSON.parse(fs.readFileSync(keymapPath, { encoding: 'utf8' }))
+
+      // detect and migrate Storyboarder 1.5.x keymap
+      if (
+        payload["menu:tools:pencil"] === "2" &&
+        payload["menu:tools:pen"] === "3" &&
+        payload["menu:tools:brush"] === "4" &&
+        payload["menu:tools:note-pen"] === "5" &&
+        payload["menu:tools:eraser"] === "6"
+      ) {
+        console.log('Detected a Storyboarder 1.5.x keymap. Forcing update to menu:tools:*.')
+        // force defaults override
+        delete payload["menu:tools:pencil"]
+        delete payload["menu:tools:pen"]
+        delete payload["menu:tools:brush"]
+        delete payload["menu:tools:note-pen"]
+        delete payload["menu:tools:eraser"]
+        shouldOverwrite = true
+      }
+    } catch (err) {
+      // show error, but don't overwrite the keymap file
+      console.error(err)
+      dialog.showMessageBox({
+        type: 'error',
+        message: `Whoops! An error ocurred while trying to read ${keymapPath}.\nUsing default keymap instead.\n\n${err}`
+      })
+    }
+  } else {
+    // create new keymap.json
+    shouldOverwrite = true
   }
+
+  // merge with defaults
+  store.dispatch({
+    type: 'SET_KEYMAP',
+    payload
+  })
+
+  // what changed?
+  let a = payload
+  let b = store.getState().entities.keymap
+  let keys = new Set([...Object.keys(a), ...Object.keys(b)])
+  for (let key of keys) {
+    if (a[key] !== b[key]) {
+      console.log(key, 'changed from', a[key], 'to', b[key])
+      shouldOverwrite = true
+    }
+  }
+
+  if (shouldOverwrite) {
+    console.log('Writing', keymapPath)
+    fs.writeFileSync(keymapPath, JSON.stringify(store.getState().entities.keymap, null, 2) + '\n')
+  }
+
+
 
   if (os.platform() === 'darwin') {
     if (!isDev && !app.isInApplicationsFolder()) {
@@ -225,7 +271,7 @@ let openKeyCommandWindow = () => {
     show: false,
     resizable: false,
     frame: false,
-    titleBarStyle: 'hidden-inset'
+    titleBarStyle: 'hiddenInset'
   })
   keyCommandWindow.loadURL(`file://${__dirname}/../keycommand-window.html`)
   keyCommandWindow.once('ready-to-show', () => {
@@ -735,6 +781,7 @@ const createAndLoadScene = aspectRatio =>
     dialog.showSaveDialog({
       title: "New Storyboard",
       buttonLabel: "Create",
+      defaultPath: app.getPath('documents'),
     },
     async filename => {
       if (filename) {
@@ -822,7 +869,7 @@ let loadStoryboarderWindow = (filename, scriptData, locations, characters, board
     minHeight: 640,
     show: false,
     resizable: true,
-    titleBarStyle: 'hidden-inset',
+    titleBarStyle: 'hiddenInset',
     webPreferences: {
       webgl: true,
       experimentalFeatures: true,
@@ -839,7 +886,7 @@ let loadStoryboarderWindow = (filename, scriptData, locations, characters, board
     backgroundColor: '#333333',
     show: false,
     frame: false,
-    resizable: false
+    resizable: isDev ? true : false
   })
   loadingStatusWindow.loadURL(`file://${__dirname}/../loading-status.html?name=${encodeURIComponent(projectName)}`)
   loadingStatusWindow.once('ready-to-show', () => {
@@ -874,6 +921,7 @@ let loadStoryboarderWindow = (filename, scriptData, locations, characters, board
     analytics.screenView('main')
   })
 
+  // TODO could move this to main-window code?
   if (isDev) {
     mainWindow.webContents.on('devtools-focused', event => { mainWindow.webContents.send('devtools-focused') })
     mainWindow.webContents.on('devtools-closed', event => { mainWindow.webContents.send('devtools-closed') })
@@ -1032,9 +1080,8 @@ ipcMain.on('redo', (e, arg)=> {
   mainWindow.webContents.send('redo')
 })
 
-ipcMain.on('setTool', (e, arg)=> {
-  mainWindow.webContents.send('setTool', arg)
-})
+ipcMain.on('setTool', (e, arg) =>
+  mainWindow.webContents.send('setTool', arg))
 
 ipcMain.on('useColor', (e, arg)=> {
   mainWindow.webContents.send('useColor', arg)
@@ -1161,6 +1208,9 @@ ipcMain.on('toggleGuide', (event, arg) => {
   mainWindow.webContents.send('toggleGuide', arg)
 })
 
+ipcMain.on('toggleOnionSkin', event =>
+  mainWindow.webContents.send('toggleOnionSkin'))
+
 ipcMain.on('toggleNewShot', (event, arg) => {
   mainWindow.webContents.send('toggleNewShot', arg)
 })
@@ -1187,6 +1237,9 @@ ipcMain.on('exportImages', (event, arg) => {
 
 ipcMain.on('exportPDF', (event, arg) => {
   mainWindow.webContents.send('exportPDF', arg)
+})
+ipcMain.on('exportWeb', (event, arg) => {
+  mainWindow.webContents.send('exportWeb', arg)
 })
 ipcMain.on('exportZIP', (event, arg) => {
   mainWindow.webContents.send('exportZIP', arg)
@@ -1267,3 +1320,18 @@ ipcMain.on('exportPrintablePdf', (event, sourcePath, fileName) => {
 ipcMain.on('toggleAudition', (event) => {
   mainWindow.webContents.send('toggleAudition')
 })
+
+// uploader > main-window
+ipcMain.on('signInSuccess', (event, response) => {
+  mainWindow.webContents.send('signInSuccess', response)
+})
+
+ipcMain.on('revealShotGenerator',
+  event => mainWindow.webContents.send('revealShotGenerator'))
+
+ipcMain.on('zoomReset',
+  event => mainWindow.webContents.send('zoomReset'))
+ipcMain.on('zoomIn',
+  event => mainWindow.webContents.send('zoomIn'))
+ipcMain.on('zoomOut',
+  event => mainWindow.webContents.send('zoomOut'))
